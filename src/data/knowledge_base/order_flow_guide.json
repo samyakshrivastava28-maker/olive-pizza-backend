@@ -1,0 +1,155 @@
+{
+  "_meta": {
+    "title": "Olive Pizza — Complete Order Flow Guide",
+    "description": "Step-by-step guide to help customers place, track, and manage orders on Olive Pizza.",
+    "lastUpdated": "2025-07-31"
+  },
+  "order_flow": {
+    "overview": "Ordering from Olive Pizza is simple and takes under 3 minutes. Here's a complete step-by-step guide.",
+    "steps": [
+      {
+        "step": 1,
+        "title": "Browse the Menu",
+        "route": "/menu",
+        "description": "Visit the Menu page to see all available pizzas, garlic breads, sides, beverages, and desserts. You can filter by category (Pizza, Sides, Drinks, Combos) or use the search bar to find a specific item.",
+        "tips": [
+          "Use the Veg filter to see only vegetarian options (Olive Pizza is 100% Veg — no filter needed!).",
+          "Use the search bar to find items by name (e.g., 'paneer', 'garlic bread', 'combo').",
+          "Tap a product card to see its full description, ingredients, sizes, and toppings."
+        ],
+        "aiAssistance": "Ask me: 'Show me all pizzas', 'What are your best deals?', 'Recommend a spicy option', or 'Show me something under ₹300'."
+      },
+      {
+        "step": 2,
+        "title": "Choose Your Pizza & Customise",
+        "route": "/menu",
+        "description": "Click on any pizza to open the customisation panel. Select your preferred size (Small 7\", Medium 10\", or Large 12\"), crust type (Classic, Cheese Burst, Thin Crust, Whole Wheat), and add extra toppings (Jalapeños, Corn, Extra Cheese, Paneer, Mushroom, etc.).",
+        "tips": [
+          "Medium (10\") serves 2-3 people. Large (12\") serves 3-4 people.",
+          "Cheese Burst crust costs ₹49 extra — absolutely worth it!",
+          "Each extra topping is ₹15–₹49 depending on the topping."
+        ],
+        "aiAssistance": "Ask me: 'Add a Medium Spicy Veg Pizza with Cheese Burst crust and Jalapeños', or 'What toppings can I add?'."
+      },
+      {
+        "step": 3,
+        "title": "Add to Cart",
+        "route": "/menu",
+        "description": "After selecting your size, crust, and toppings, click the 'Add to Cart' button. The item is added to your cart with a confirmation animation. You can add multiple items from the menu.",
+        "tips": [
+          "You can update quantities directly in the Cart page.",
+          "The floating cart button shows your current item count.",
+          "Keep adding more items — there's no limit!"
+        ],
+        "aiAssistance": "Ask me: 'Add Mozzarella Cheese Burst to my cart', 'Add 2 Garlic Breads', or 'What's in my cart?'."
+      },
+      {
+        "step": 4,
+        "title": "Review Your Cart",
+        "route": "/cart",
+        "description": "Go to the Cart page to review all items, quantities, sizes, and individual prices. You can increase or decrease quantities, remove items, and see the subtotal, delivery charge, and total amount.",
+        "tips": [
+          "Minimum order amount is ₹199 for delivery.",
+          "Free delivery is available on orders above the threshold shown in the app.",
+          "Make sure all your items and quantities are correct before proceeding."
+        ],
+        "aiAssistance": "Ask me: 'Show me my cart', 'Remove garlic bread from cart', or 'Increase pizza quantity to 2'."
+      },
+      {
+        "step": 5,
+        "title": "Apply a Coupon or Discount Code",
+        "route": "/cart",
+        "description": "In the Cart page, find the 'Have a Coupon?' section. Enter your coupon code and click 'Apply'. Valid coupons will instantly reduce your order total. Current active coupons: BEST50 (₹50 off on ₹399+), PIZZA20 (20% off first order), FEAST (₹100 off Family Pack).",
+        "tips": [
+          "Coupon codes are case-insensitive (BEST50 = best50).",
+          "Only one coupon can be applied per order.",
+          "If a coupon is invalid, you'll see an error message — double-check the spelling."
+        ],
+        "activeCoupons": [
+          { "code": "BEST50", "benefit": "₹50 OFF on orders above ₹399" },
+          { "code": "PIZZA20", "benefit": "20% OFF on first order (min ₹299)" },
+          { "code": "FEAST", "benefit": "₹100 OFF on orders above ₹799" }
+        ],
+        "aiAssistance": "Ask me: 'Apply coupon BEST50', 'What coupons do you have?', or 'Apply the best available coupon for my cart'."
+      },
+      {
+        "step": 6,
+        "title": "Enter Delivery Address",
+        "route": "/checkout",
+        "description": "Proceed to checkout and enter your delivery address. You can type a new address or select from your saved addresses (if logged in). Make sure the address includes your flat/house number, street, landmark, and PIN code for accurate delivery.",
+        "tips": [
+          "Save your address to your account for faster checkout next time.",
+          "Delivery is available within 8 km of Rajnandgaon.",
+          "Include a landmark for easier navigation by our delivery partner."
+        ],
+        "aiAssistance": "Ask me: 'How do I add a delivery address?', 'Can you deliver to Civil Lines, Rajnandgaon?', or 'How do I save my address?'."
+      },
+      {
+        "step": 7,
+        "title": "Choose Payment Method",
+        "route": "/checkout",
+        "description": "Select your preferred payment method: UPI (GPay, PhonePe, Paytm), Credit/Debit Card, Net Banking, or Cash on Delivery (COD). For UPI/Card payments, you'll be redirected to our secure payment gateway. For COD, you pay when your order arrives.",
+        "tips": [
+          "UPI is the fastest and most reliable payment method.",
+          "COD is available but please have the exact change ready.",
+          "Your card details are never stored — we use a secure payment gateway."
+        ],
+        "aiAssistance": "Ask me: 'Can I pay by cash?', 'Is GPay accepted?', or 'Set my payment to Cash on Delivery'."
+      },
+      {
+        "step": 8,
+        "title": "Place Your Order",
+        "route": "/checkout",
+        "description": "Review your final order summary (items, address, payment method, total). Click 'Place Order' to confirm. For UPI/Card, complete the payment on the payment gateway. Your order is placed once payment is confirmed.",
+        "tips": [
+          "You'll receive an order confirmation on screen and via SMS/email.",
+          "Your order ID is shown after placement — save it for tracking.",
+          "For COD orders, no payment action is needed — just confirm the order."
+        ],
+        "aiAssistance": "Ask me: 'Place my order', 'Confirm my order with COD', or 'Take me to checkout'."
+      },
+      {
+        "step": 9,
+        "title": "Track Your Order",
+        "route": "/order-tracking/:orderId",
+        "description": "After placing your order, you can track it in real time. Go to the Order Tracking page (linked from your confirmation screen or dashboard). Status updates include: Order Received → Preparing → Ready for Pickup → Out for Delivery → Delivered.",
+        "statuses": [
+          { "status": "Order Received", "description": "Your order has been successfully placed and sent to the kitchen.", "emoji": "✅" },
+          { "status": "Preparing", "description": "Our chefs are freshly making your pizza right now.", "emoji": "👨‍🍳" },
+          { "status": "Ready for Pickup", "description": "Your order is freshly made and being picked up by the delivery partner.", "emoji": "📦" },
+          { "status": "Out for Delivery", "description": "Your order is on its way! Estimated arrival: 10–15 minutes.", "emoji": "🛵" },
+          { "status": "Delivered", "description": "Your order has been delivered. Enjoy your pizza! 🍕", "emoji": "🎉" }
+        ],
+        "tips": [
+          "Track in real time from your dashboard or the Order Tracking page.",
+          "Estimated delivery time: 30–45 minutes from order confirmation.",
+          "Contact us if your order is delayed beyond 60 minutes."
+        ],
+        "aiAssistance": "Ask me: 'Where is my order?', 'Track my order', or 'What is the status of my last order?'."
+      }
+    ]
+  },
+  "order_modifications": {
+    "title": "Can I Modify My Order After Placing?",
+    "content": "Orders can be modified within 5 minutes of placement. After 5 minutes, once the kitchen begins preparation, modifications may not be possible. To modify, go to Order Tracking and look for the 'Modify Order' option (visible only if modification is still possible), or contact support immediately.",
+    "contactSupport": "Call us at our helpline or use the 'Contact' page to reach our team."
+  },
+  "common_issues": [
+    {
+      "issue": "Payment failed",
+      "solution": "If your payment failed, your order was NOT placed. Please try again with a different payment method or retry UPI. Check your bank/UPI app to ensure no amount was deducted. If money was deducted but order wasn't placed, contact us within 24 hours for a refund."
+    },
+    {
+      "issue": "Wrong item received",
+      "solution": "We're sorry! Please raise a refund request within 2 hours via the Order Tracking page or call us. We'll issue a full refund or send a replacement."
+    },
+    {
+      "issue": "Order delayed beyond 60 minutes",
+      "solution": "Please call us or use the Contact page. Extreme weather, high demand, or traffic may cause delays. We apologise for the inconvenience."
+    },
+    {
+      "issue": "Coupon not working",
+      "solution": "Check the minimum order amount for the coupon. Ensure the code is spelled correctly. Only one coupon can be applied per order. Contact support if the issue persists."
+    }
+  ]
+}

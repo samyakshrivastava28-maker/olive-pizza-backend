@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package olivepizza.delivery.v1;
+
+service DeliveryService {
+  rpc AssignRider(AssignRiderRequest) returns (AssignRiderResponse);
+  rpc UpdateLifecycleStage(LifecycleRequest) returns (LifecycleResponse);
+}
+
+message AssignRiderRequest {
+  string order_id = 1;
+  string branch_id = 2;
+  string rider_id = 3;
+  string reason = 4;
+  string actor_id = 5;
+  string actor_role = 6;
+  string actor_name = 7;
+}
+
+message AssignRiderResponse {
+  bool success = 1;
+  string order_id = 2;
+  string rider_id = 3;
+  string rider_name = 4;
+  string status = 5;
+  string error = 6;
+}
+
+message LifecycleRequest {
+  string order_id = 1;
+  string rider_id = 2;
+  string target_stage = 3;
+  string reason = 4;
+  string metadata_json = 5;
+}
+
+message LifecycleResponse {
+  bool success = 1;
+  string current_stage = 2;
+  string error = 3;
+}

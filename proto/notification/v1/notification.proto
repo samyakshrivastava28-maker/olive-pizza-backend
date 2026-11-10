@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package olivepizza.notification.v1;
+
+service NotificationService {
+  rpc DispatchOrderNotification(NotificationRequest) returns (NotificationResponse);
+}
+
+message NotificationRequest {
+  string order_id = 1;
+  string event_type = 2;
+  string recipient_uid = 3;
+  string title = 4;
+  string body = 5;
+  string category = 6;
+  string priority = 7;
+  string sound = 8;
+  string data_json = 9;
+  string event_id = 10;
+  string target_app = 11;
+}
+
+message NotificationResponse {
+  bool success = 1;
+  int32 dispatched_count = 2;
+  string status = 3;
+  string error = 4;
+}

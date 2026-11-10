@@ -1,0 +1,12 @@
+{
+  "id": "olive-pizza-brand",
+  "name": "Olive Pizza",
+  "title": "About Olive Pizza Restaurant",
+  "tagline": "Handcrafted Woodfired Pure Veg Delicacies",
+  "description": "Olive Pizza is Rajnandgaon's premier 100% Pure Vegetarian artisan woodfired pizzeria, serving fresh handcrafted dough, Italian stone-oven baked crusts, rich mozzarella, and authentic herbs. Our kitchen is 100% strictly pure veg (🌱) and prepares special Jain options (no onion, no garlic) on request.",
+  "fssaiNumber": "10522016000123",
+  "pureVeg": true,
+  "jainFriendly": true,
+  "operatingHours": "11:00 AM - 11:00 PM (Daily)",
+  "location": "Rajnandgaon, Chhattisgarh"
+}

@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package olivepizza.payment.v1;
+
+service PaymentService {
+  rpc VerifyAndReconcilePayment(VerifyPaymentRequest) returns (PaymentResult);
+  rpc ProcessWebhook(WebhookRequest) returns (WebhookResult);
+}
+
+message VerifyPaymentRequest {
+  string payment_id = 1;
+  string order_id = 2;
+  double amount = 3;
+  string currency = 4;
+  string provider = 5;
+  string provider_tx_id = 6;
+  string idempotency_key = 7;
+}
+
+message PaymentResult {
+  bool verified = 1;
+  string payment_id = 2;
+  string order_id = 3;
+  string status = 4;
+  double amount = 5;
+  string currency = 6;
+  string error = 7;
+  bool is_duplicate = 8;
+}
+
+message WebhookRequest {
+  string provider = 1;
+  string payload_json = 2;
+  string signature = 3;
+  string idempotency_key = 4;
+}
+
+message WebhookResult {
+  bool success = 1;
+  string event_type = 2;
+  string error = 3;
+  bool is_duplicate = 4;
+}

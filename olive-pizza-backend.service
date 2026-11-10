@@ -1,0 +1,25 @@
+[Unit]
+Description=Olive Pizza Canonical Backend Service
+After=network.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/var/www/olive-pizza-owner/backend
+EnvironmentFile=/var/www/olive-pizza-owner/backend/.env
+ExecStart=/usr/bin/npx tsx server.ts
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=olive-pizza-backend
+
+# Security Sandbox Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

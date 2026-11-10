@@ -1,0 +1,142 @@
+{
+  "_meta": {
+    "title": "Olive Pizza — Legal Policies & Important Terms",
+    "description": "All legal policies, terms of service, refund rules, delivery policies, and privacy rules for Olive Pizza.",
+    "lastUpdated": "2026-08-16"
+  },
+  "policies": [
+    {
+      "id": "privacy",
+      "title": "Privacy Policy",
+      "route": "/privacy-policy",
+      "category": "Legal",
+      "summary": "How Olive Pizza collects, protects, and handles your personal data.",
+      "content": "Olive Pizza is committed to safeguarding your privacy and personal data under applicable data protection regulations. We collect only necessary details: your full name, mobile phone number, email address, and delivery coordinates for the sole purpose of preparing, dispatching, and delivering your food orders. We NEVER sell, rent, or lease your personal information to third parties for marketing. All payment transactions are encrypted end-to-end and processed directly by our authorized payment gateways (PhonePe, Razorpay) — Olive Pizza never stores your credit/debit card numbers, CVVs, or UPI PINs. We use cookies and local storage exclusively to preserve your active shopping cart, saved delivery addresses, and user preferences. You hold the complete right to access, rectify, or permanently delete your account and personal records at any time by visiting /delete-account or contacting support@olivepizza.in. Data is retained only as long as required to fulfill orders and satisfy statutory accounting obligations.",
+      "keyPoints": [
+        "We collect Name, Phone, Email, and Delivery Address only.",
+        "Zero third-party data selling or marketing sharing.",
+        "Card details, CVVs, and UPI PINs are NEVER stored on our servers.",
+        "End-to-end encrypted transactions via PhonePe and Razorpay.",
+        "Full account and data deletion available at /delete-account or via support.",
+        "Local cookies used strictly for cart persistence and seamless navigation."
+      ]
+    },
+    {
+      "id": "refund",
+      "title": "Refund & Quality Guarantee Policy",
+      "route": "/refund-policy",
+      "category": "Legal",
+      "summary": "Rules and timelines for refunds, replacements, and quality assurance.",
+      "content": "At Olive Pizza, we stand behind our 100% Handcrafted Woodfired Quality Guarantee. If your order arrives incorrect, physically damaged, cold due to excessive courier delay, or unsatisfactory in quality, you are eligible for an immediate full refund or complimentary priority replacement. Refund requests must be reported within 2 hours of delivery through the Live Order Tracking screen, WhatsApp support, or by calling our customer helpline. Once verified by our team, refunds for online payments (UPI, Cards, Net Banking) are automatically credited back to your original payment source within 3 to 5 business days. For Cash on Delivery (COD) orders, approved refunds are instantly credited to your Olive Pizza Store Wallet for use on your next order.",
+      "keyPoints": [
+        "2-hour issue reporting window post-delivery.",
+        "Eligible issues: Wrong item, transit damage, missing items, poor quality.",
+        "Online payment refunds settled in 3 to 5 business days.",
+        "COD refunds credited immediately as Olive Pizza Wallet balance.",
+        "100% full refund for cancellations made before kitchen preparation begins.",
+        "Dedicated priority replacement dispatched free of charge if preferred."
+      ]
+    },
+    {
+      "id": "cancellation",
+      "title": "Cancellation Policy",
+      "route": "/cancellation-policy",
+      "category": "Legal",
+      "summary": "Guidelines for canceling an active food order.",
+      "content": "Orders can be canceled with an instant 100% refund within 5 minutes of placing, before our kitchen starts handcrafting and baking your pizza in the woodfired oven. To cancel an active order, navigate to the Order Tracking page (/order-tracking) and tap 'Cancel Order', or ask the AI Assistant 'Cancel my order'. Once our kitchen begins preparation (status changes to 'Preparing'), cancellation is no longer possible because each pizza is freshly prepared to order. If you encounter an exceptional circumstance after preparation starts, please contact customer support immediately.",
+      "keyPoints": [
+        "Instant 100% refund when canceled within 5 minutes of placing order.",
+        "1-tap cancellation directly on Order Tracking screen or via AI Assistant.",
+        "Once status changes to 'Preparing', kitchen baking is irreversible.",
+        "Contact support immediately for exceptional delivery address changes."
+      ]
+    },
+    {
+      "id": "delivery",
+      "title": "Delivery & Service Zone Policy",
+      "route": "/delivery-policy",
+      "category": "Operations",
+      "summary": "Delivery coverage, charges, live tracking, and timings in Rajnandgaon.",
+      "content": "Olive Pizza operates daily from 11:00 AM to 11:00 PM, delivering piping hot artisan pizzas across Rajnandgaon, Chhattisgarh (Pincode: 491441) within an 8 kilometer radius from our central restaurant. Standard delivery turnaround is 30 to 45 minutes from order confirmation. Every order is packed in custom thermal heat-insulated boxes with tamper-evident hygiene seals to preserve maximum crispiness and aroma. Delivery is completely FREE on orders above the minimum free-delivery threshold (₹350), with a transparent nominal distance-based fee (starting at ₹30) applied to smaller orders. Real-time GPS tracking is provided on an interactive map once your delivery partner is dispatched.",
+      "keyPoints": [
+        "Service Radius: 8 km across Rajnandgaon city (Chhattisgarh 491441).",
+        "Covered Localities: Ganj Para, Tulsi Pur, Kaurin Bhatha, Halwai Line, Basant Pur, Collectorate, Railway Station Road, Chikhali.",
+        "Delivery Promise: 30 to 45 minutes in thermal heat-insulated boxes.",
+        "Free Delivery available on all orders above ₹350.",
+        "Live GPS delivery partner tracking on interactive map.",
+        "Tamper-proof safety seals on every package."
+      ]
+    },
+    {
+      "id": "terms",
+      "title": "Terms of Service",
+      "route": "/terms",
+      "category": "Legal",
+      "summary": "Master legal terms governing use of Olive Pizza platforms and ordering.",
+      "content": "By accessing Olive Pizza's website, mobile web app, or utilizing our 24/7 AI Concierge, you agree to comply with our Terms of Service. Customers must provide accurate delivery information and maintain an active phone number to coordinate with delivery partners. Account holders must be at least 18 years of age or possess parental consent. All prices listed on our menu are in Indian Rupees (INR) and are subject to 5% statutory GST at checkout. Olive Pizza reserves the right to cancel or refuse orders exhibiting fraudulent patterns, unauthorized automated bot scripts, or abuse of promotional coupons. All recipes, branding, logos, 3D animations, and software interfaces remain the exclusive intellectual property of Olive Pizza.",
+      "keyPoints": [
+        "Accurate phone number and delivery address required for fulfillment.",
+        "Prices in INR with transparent 5% GST applied at checkout.",
+        "Only one coupon code may be redeemed per order; coupon abuse is prohibited.",
+        "Olive Pizza reserves the right to decline fraudulent or bot orders.",
+        "All trademarks, logos, and UI assets are proprietary property."
+      ]
+    },
+    {
+      "id": "payment",
+      "title": "Payment & Security Policy",
+      "route": "/payment-policy",
+      "category": "Finance",
+      "summary": "Supported payment methods, gateway security, and failed payment recovery.",
+      "content": "Olive Pizza offers safe, seamless, and encrypted payment options across all devices. We support UPI (Google Pay, PhonePe, Paytm, BHIM, CRED), Credit & Debit Cards (Visa, Mastercard, RuPay, Maestro), Net Banking across 50+ Indian banks, Digital Wallets, and Cash on Delivery (COD) for all eligible delivery addresses. Online transactions are secured via 256-bit SSL encryption through PhonePe and Razorpay payment gateways. If your money is debited during a failed transaction, our automated payment reconciliation engine detects and initiates a reverse settlement back to your bank account within 24 to 48 hours.",
+      "keyPoints": [
+        "Supported: UPI, Cards (Visa/Mastercard/RuPay), Net Banking, Wallets, and COD.",
+        "256-bit SSL encryption via PhonePe & Razorpay Gateways.",
+        "Zero card details or credentials stored on Olive Pizza servers.",
+        "Automated auto-refund recovery for failed bank transactions within 24-48 hours.",
+        "Cash on Delivery available without surcharge."
+      ]
+    },
+    {
+      "id": "cookie",
+      "title": "Cookie & Local Storage Policy",
+      "route": "/legal/cookie-policy",
+      "category": "Legal",
+      "summary": "How Olive Pizza uses cookies and client-side storage.",
+      "content": "We use essential cookies and browser LocalStorage to provide fundamental functionality: maintaining your login authentication session, keeping your pizza customisation and cart items persistent across page reloads, and storing your dark mode / theme preference. We do not employ intrusive tracking cookies or sell your browsing history to third-party ad networks. You may disable cookies in your browser settings at any time, though this will prevent cart persistence.",
+      "keyPoints": [
+        "Essential cookies only for login session and cart persistence.",
+        "No invasive cross-site advertising tracking cookies.",
+        "User preferences (theme, location) stored locally on your device.",
+        "Can be cleared at any time via browser settings."
+      ]
+    },
+    {
+      "id": "accessibility",
+      "title": "Accessibility Statement",
+      "route": "/legal/accessibility",
+      "category": "Legal",
+      "summary": "Olive Pizza's commitment to digital inclusion and WCAG 2.1 AA standards.",
+      "content": "Olive Pizza is dedicated to providing an inclusive and accessible digital ordering experience for all customers, including individuals with disabilities. Our web platform adheres to Web Content Accessibility Guidelines (WCAG 2.1 Level AA) by incorporating semantic HTML landmarks, ARIA labeling on all interactive buttons, full keyboard navigation support, high-contrast color palettes, reduced-motion preferences, and screen reader compatibility. Our 24/7 AI Voice & Text Concierge enables fully hands-free ordering.",
+      "keyPoints": [
+        "Compliant with WCAG 2.1 Level AA accessibility standards.",
+        "Complete keyboard navigation and screen-reader optimizations.",
+        "High-contrast text and respect for prefers-reduced-motion OS settings.",
+        "Hands-free voice ordering powered by Olive Pizza AI."
+      ]
+    },
+    {
+      "id": "delete-account",
+      "title": "Account Deletion & Data Erasure Policy",
+      "route": "/delete-account",
+      "category": "Privacy",
+      "summary": "Self-service data removal and account cancellation.",
+      "content": "Customers have the absolute right to delete their Olive Pizza account and permanently erase all personal data from our systems. You can initiate instant account deletion directly via the self-service page at /delete-account when signed in, or by emailing our privacy officer at support@olivepizza.in. Upon confirmation, your profile, authentication credentials, address book, and active FCM notification tokens are permanently wiped from PostgreSQL and Firebase Firestore databases within 48 hours.",
+      "keyPoints": [
+        "Instant self-service account deletion at /delete-account.",
+        "Full erasure of profile, addresses, phone number, and tokens within 48 hours.",
+        "Anonymization of historical financial invoices to comply with tax laws."
+      ]
+    }
+  ]
+}

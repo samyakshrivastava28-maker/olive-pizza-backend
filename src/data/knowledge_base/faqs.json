@@ -1,0 +1,135 @@
+{
+  "_meta": {
+    "title": "Olive Pizza — Frequently Asked Questions",
+    "description": "Complete categorized customer FAQ database for Olive Pizza.",
+    "lastUpdated": "2026-08-16"
+  },
+  "faqs": [
+    {
+      "id": "faq-order-1",
+      "category": "Ordering",
+      "question": "How do I place an order on Olive Pizza?",
+      "answer": "You can place an order in two easy ways: (1) Browse our visual menu at /menu, choose your favorite handcrafted woodfired pizzas, select size and crust, and click 'Add to Cart'. (2) Talk to our 24/7 AI Assistant by saying 'Order a Farmhouse Pizza' or 'Add 1 Margherita with Cheese Burst' and the AI will add it to your cart and guide you through instant checkout."
+    },
+    {
+      "id": "faq-order-2",
+      "category": "Ordering",
+      "question": "Can I customise my pizza crust, size, and toppings?",
+      "answer": "Yes! Every artisan pizza is customizable. Choose from Small (7 inch, 4 slices), Medium (10 inch, 6 slices), or Large (12 inch, 8 slices). Select your preferred crust: Classic Hand Tossed, Cheese Burst (filled with liquid cheese), Thin Crust, or Fluffy Pan Crust. Add premium vegetarian toppings including Extra Cheese, Fresh Paneer, Jalapeños, Mushrooms, Black Olives, Sweet Corn, and Crisp Bell Peppers."
+    },
+    {
+      "id": "faq-order-3",
+      "category": "Ordering",
+      "question": "Can I modify my order after placing it?",
+      "answer": "Orders can be modified or canceled within 5 minutes of placing. Once our kitchen begins baking (status changes to 'Preparing'), modifications cannot be accepted because every pizza is prepared fresh to order. If you need urgent assistance, contact customer support immediately."
+    },
+    {
+      "id": "faq-order-4",
+      "category": "Ordering",
+      "question": "Is there a minimum order amount for delivery?",
+      "answer": "Yes, standard delivery requires a nominal minimum order value of ₹150. Delivery is completely FREE on all orders above ₹350. The exact delivery fee is shown transparently at checkout before you pay."
+    },
+    {
+      "id": "faq-order-5",
+      "category": "Ordering",
+      "question": "Can the AI assistant place an order or add items to my cart?",
+      "answer": "Yes! Olive Pizza AI is a full-featured conversational concierge. You can say 'Add a Medium Farmhouse Pizza with Cheese Burst', 'Apply coupon BEST50', 'What is in my cart?', or 'Place order'. The AI will update your live cart, calculate taxes and delivery fees, display an order confirmation card, and navigate you directly to checkout."
+    },
+    {
+      "id": "faq-track-1",
+      "category": "Order Tracking",
+      "question": "How do I track my pizza order in real time?",
+      "answer": "After placing an order, you will be redirected to the Live Order Tracking screen at /order-tracking/:orderId. You will see live 4-stage milestones (Order Placed ➔ Baking in Kitchen ➔ Out for Delivery ➔ Delivered) alongside interactive GPS location updates of your delivery partner."
+    },
+    {
+      "id": "faq-track-2",
+      "category": "Order Tracking",
+      "question": "How long does delivery take?",
+      "answer": "Our standard delivery turnaround is 30 to 45 minutes from the time your order is confirmed. During peak weekend dinner hours or heavy monsoon rain, delivery may take up to 50 minutes. Your live ETA is visible on the tracking screen."
+    },
+    {
+      "id": "faq-track-3",
+      "category": "Order Tracking",
+      "question": "What should I do if my delivery is delayed?",
+      "answer": "If your order has not arrived within 45 minutes, check the Live Tracking screen for the delivery partner's location, or click 'Call Partner' / 'Contact Support'. If your order arrives cold due to severe delay, our 100% Quality Guarantee provides a free replacement or refund."
+    },
+    {
+      "id": "faq-payment-1",
+      "category": "Payments",
+      "question": "What payment methods are accepted?",
+      "answer": "We accept UPI (Google Pay, PhonePe, Paytm, BHIM, CRED), Credit Cards (Visa, Mastercard, RuPay, Amex), Debit Cards, Net Banking across 50+ banks, Digital Wallets, and Cash on Delivery (COD). All online transactions are protected by 256-bit SSL encryption via PhonePe and Razorpay."
+    },
+    {
+      "id": "faq-payment-2",
+      "category": "Payments",
+      "question": "My payment failed or money was deducted but order was not placed. What happens?",
+      "answer": "If payment fails, your order is not confirmed. If money was debited from your bank account, our automated payment reconciliation engine automatically reverses the amount back to your source account within 24 to 48 banking hours. You can also contact support with your transaction reference for instant verification."
+    },
+    {
+      "id": "faq-payment-3",
+      "category": "Payments",
+      "question": "Is Cash on Delivery (COD) available?",
+      "answer": "Yes! Cash on Delivery is available across all delivery locations within our 8 km service zone in Rajnandgaon. You can pay with cash or scan the delivery partner's UPI QR code at your doorstep upon arrival."
+    },
+    {
+      "id": "faq-coupon-1",
+      "category": "Coupons & Offers",
+      "question": "How do I apply a discount coupon?",
+      "answer": "On the Cart page or Checkout screen, enter your coupon code into the 'Have a Coupon?' field and tap 'Apply'. You can also ask the AI Assistant: 'Apply coupon BEST50' or 'What coupons are available?' and the AI will check eligibility and apply the highest discount for you."
+    },
+    {
+      "id": "faq-coupon-2",
+      "category": "Coupons & Offers",
+      "question": "Can I use multiple coupons on a single order?",
+      "answer": "Only one coupon code can be redeemed per order. However, coupon discounts can be combined with existing product offer prices and free delivery promotions."
+    },
+    {
+      "id": "faq-refund-1",
+      "category": "Refunds & Cancellations",
+      "question": "What is Olive Pizza's refund policy?",
+      "answer": "If you receive an incorrect order, damaged food, or unsatisfactory quality, report the issue within 2 hours of delivery via Order Tracking or phone support. Verified refund requests for online payments are credited to your bank account within 3 to 5 business days. COD refunds are instantly credited to your Olive Pizza wallet."
+    },
+    {
+      "id": "faq-refund-2",
+      "category": "Refunds & Cancellations",
+      "question": "How do I cancel my order for a 100% refund?",
+      "answer": "You can cancel your order within 5 minutes of placing it for an instant 100% full refund directly from the Order Tracking screen or by telling the AI Assistant 'Cancel my order'."
+    },
+    {
+      "id": "faq-diet-1",
+      "category": "Menu & Dietary",
+      "question": "Is Olive Pizza 100% Pure Vegetarian?",
+      "answer": "Yes! Olive Pizza is proud to be a 100% Pure Vegetarian kitchen (🌱). We do NOT store, cook, or handle any meat, poultry, fish, seafood, or egg products whatsoever. All cheeses, paneer, and pizza dough are certified 100% vegetarian."
+    },
+    {
+      "id": "faq-diet-2",
+      "category": "Menu & Dietary",
+      "question": "Do you offer Jain-friendly pizzas (No Onion, No Garlic)?",
+      "answer": "Yes! We prepare special Jain pizzas crafted without onion, garlic, or root vegetables. You can select the Jain option during customisation or ask the AI Assistant: 'Show me Jain-friendly pizzas'."
+    },
+    {
+      "id": "faq-diet-3",
+      "category": "Menu & Dietary",
+      "question": "Do you have spicy pizzas for spice lovers?",
+      "answer": "Yes! Try our Peri Peri Fiesta, Spicy Arrabbiata, or Schezwan Paneer Pizza. You can also customize any pizza with extra Jalapeños and Red Paprika."
+    },
+    {
+      "id": "faq-delivery-1",
+      "category": "Delivery & Areas",
+      "question": "Which areas in Rajnandgaon do you deliver to?",
+      "answer": "We deliver within an 8 km radius from our restaurant in Rajnandgaon, Chhattisgarh (491441). Areas covered include Ganj Para, Tulsi Pur, Kaurin Bhatha, Halwai Line, Basant Pur, Collectorate Area, Railway Station Road, Chikhali, Nandai, and surrounding neighborhoods."
+    },
+    {
+      "id": "faq-delivery-2",
+      "category": "Delivery & Areas",
+      "question": "What are the store timings?",
+      "answer": "Olive Pizza is open 7 days a week from 11:00 AM to 11:00 PM for online delivery, takeaway, and dine-in."
+    },
+    {
+      "id": "faq-contact-1",
+      "category": "Support & Contact",
+      "question": "How can I contact Olive Pizza customer support?",
+      "answer": "Reach us anytime via: (1) Our Contact page at /contact, (2) Phone / WhatsApp helpline at +91 98765 43210, (3) Email at support@olivepizza.in, or (4) 24/7 AI Concierge right here in the chat!"
+    }
+  ]
+}

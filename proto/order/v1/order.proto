@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package olivepizza.order.v1;
+
+service OrderService {
+  rpc ValidateOrderTransition(TransitionRequest) returns (TransitionResponse);
+  rpc GetAuthoritativeOrder(GetOrderRequest) returns (OrderResponse);
+  rpc UpdatePaymentState(UpdatePaymentRequest) returns (UpdatePaymentResponse);
+}
+
+message TransitionRequest {
+  string order_id = 1;
+  string to_status = 2;
+  string actor_id = 3;
+  string actor_role = 4;
+  string actor_name = 5;
+  string branch_id = 6;
+  string metadata_json = 7;
+}
+
+message TransitionResponse {
+  bool success = 1;
+  string order_id = 2;
+  string previous_status = 3;
+  string current_status = 4;
+  int32 version = 5;
+  string message = 6;
+  string error = 7;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message OrderItem {
+  string id = 1;
+  string name = 2;
+  int32 quantity = 3;
+  double price = 4;
+  double line_total = 5;
+  string size = 6;
+  string crust = 7;
+}
+
+message OrderResponse {
+  bool found = 1;
+  string order_id = 2;
+  string status = 3;
+  double total_amount = 4;
+  string payment_status = 5;
+  string payment_method = 6;
+  string user_id = 7;
+  string customer_name = 8;
+  string customer_phone = 9;
+  string delivery_address = 10;
+  string branch_id = 11;
+  string franchise_id = 12;
+  int32 permanent_bill_no = 13;
+  int32 daily_order_no = 14;
+  repeated OrderItem items = 15;
+  string raw_json = 16;
+  string error = 17;
+}
+
+message UpdatePaymentRequest {
+  string order_id = 1;
+  string payment_status = 2;
+  string payment_method = 3;
+  string provider_payment_id = 4;
+  double amount_paid = 5;
+  string metadata_json = 6;
+}
+
+message UpdatePaymentResponse {
+  bool success = 1;
+  string order_id = 2;
+  string payment_status = 3;
+  string error = 4;
+}

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package olivepizza.archive.v1;
+
+service ArchiveService {
+  rpc ReconcileAndFinalizeOrder(FinalizeOrderRequest) returns (FinalizeOrderResponse);
+}
+
+message FinalizeOrderRequest {
+  string order_id = 1;
+  bool force_reconcile = 2;
+}
+
+message FinalizeOrderResponse {
+  bool success = 1;
+  string order_id = 2;
+  bool already_archived = 3;
+  bool verified = 4;
+  int32 permanent_bill_no = 5;
+  string error = 6;
+}

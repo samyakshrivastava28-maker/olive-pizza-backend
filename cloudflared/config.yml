@@ -1,0 +1,21 @@
+# ☁️ Cloudflare Tunnel Configuration for Olive Pizza Canonical Backend
+# Documentation: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+
+tunnel: olive-pizza-backend-tunnel
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  # 1. Primary Canonical API & WebSockets
+  - hostname: api.olivepizza.in
+    service: http://localhost:5175
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: false
+      httpHostHeader: api.olivepizza.in
+
+  # 2. Status / Health Check Probe
+  - hostname: health.olivepizza.in
+    service: http://localhost:5175/api/ready
+
+  # 3. Catch-all fallback (returns 404 for unmapped hostnames)
+  - service: http_status:404

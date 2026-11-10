@@ -1,0 +1,119 @@
+{
+  "_meta": {
+    "title": "Olive Pizza — Website Routes & Page Guide",
+    "description": "Complete map of all website routes, their purpose, and what features each page contains.",
+    "lastUpdated": "2025-07-31"
+  },
+  "routes": [
+    {
+      "path": "/",
+      "name": "Home",
+      "description": "Main homepage with featured products, daily deals, hero banner, quick category pills, and top recommended pizzas carousel.",
+      "features": ["Hero banner with deals", "Quick category access (Pizzas, Garlic Breads, Drinks, Combos)", "Top picks carousel", "Floating cart button", "Floating AI Concierge button"],
+      "aiNavigation": "Say 'Take me home' or 'Go to homepage'."
+    },
+    {
+      "path": "/menu",
+      "name": "Menu",
+      "description": "Full live menu with all pizzas, sides, beverages, and combos fetched from Firestore. Filter by category, search by name, toggle veg filter.",
+      "features": ["Search bar", "Category filters", "Price filter", "Product cards with Add to Cart", "Real-time availability"],
+      "aiNavigation": "Say 'Show me the menu', 'Open menu', or 'Find me a spicy pizza'."
+    },
+    {
+      "path": "/cart",
+      "name": "Cart",
+      "description": "Review all selected items, update quantities, remove items, apply coupon codes, see price breakdown (subtotal, delivery charge, GST, total).",
+      "features": ["Item list with quantity controls", "Remove item", "Coupon code input", "Price breakdown", "Proceed to Checkout button"],
+      "aiNavigation": "Say 'Open cart', 'Show my cart', or 'What's in my cart?'."
+    },
+    {
+      "path": "/checkout",
+      "name": "Checkout",
+      "description": "3-step checkout: (1) Select or enter delivery address, (2) Choose payment method (UPI, Card, COD, Net Banking), (3) Review and place order.",
+      "features": ["Saved address selection", "New address form", "Payment method selection", "Order summary", "Place Order button"],
+      "aiNavigation": "Say 'Go to checkout', 'Proceed to payment', or 'Place my order'."
+    },
+    {
+      "path": "/order-tracking/:orderId",
+      "name": "Order Tracking",
+      "description": "Real-time live order tracking with status updates (Placed → Preparing → Out for Delivery → Delivered), delivery partner info, and ETA.",
+      "features": ["Live status timeline", "Delivery partner details", "ETA countdown", "Map tracking (if available)", "Call driver button"],
+      "aiNavigation": "Say 'Track my order', 'Where is my order?', or 'What is my delivery status?'."
+    },
+    {
+      "path": "/dashboard",
+      "name": "Customer Dashboard",
+      "description": "Customer account dashboard with order history, saved addresses, profile settings, loyalty points, and 1-click repeat order.",
+      "features": ["Order history", "Repeat order", "Address book", "Profile settings", "Loyalty/rewards status"],
+      "aiNavigation": "Say 'Go to my dashboard', 'Show my order history', or 'View my account'."
+    },
+    {
+      "path": "/assistant",
+      "name": "AI Assistant",
+      "description": "Full-page AI Concierge chat interface. Ask anything about menu, orders, policies, or get guided through placing an order.",
+      "features": ["Full chat interface", "Quick chips", "Product recommendation cards", "Voice input (STT)", "Add to Cart from AI chat"],
+      "aiNavigation": "This is the current page. You are already on the AI Assistant."
+    },
+    {
+      "path": "/about",
+      "name": "About Us",
+      "description": "Learn about Olive Pizza's story, mission, quality commitment, and team.",
+      "aiNavigation": "Say 'Tell me about Olive Pizza' or 'Open About page'."
+    },
+    {
+      "path": "/contact",
+      "name": "Contact Us",
+      "description": "Contact form, live phone number, email, WhatsApp link, Google Maps location, and store operating hours.",
+      "features": ["Contact form", "Phone call link", "WhatsApp button", "Google Maps", "Operating hours"],
+      "aiNavigation": "Say 'Contact support', 'How do I reach you?', or 'Open contact page'."
+    },
+    {
+      "path": "/faq",
+      "name": "FAQ",
+      "description": "Frequently asked questions about orders, delivery, refunds, payments, account management, and menu customization.",
+      "aiNavigation": "Say 'Show me FAQ', 'I have a question about...' — or just ask me directly!"
+    },
+    {
+      "path": "/privacy-policy",
+      "name": "Privacy Policy",
+      "description": "How Olive Pizza collects, uses, and protects your personal data.",
+      "aiNavigation": "Say 'Privacy policy' or 'How do you handle my data?'."
+    },
+    {
+      "path": "/refund-policy",
+      "name": "Refund Policy",
+      "description": "Rules for refunds on incorrect, damaged, or poor-quality orders. Refund window, process, and timelines.",
+      "aiNavigation": "Say 'Refund policy', 'How do I get a refund?'."
+    },
+    {
+      "path": "/terms",
+      "name": "Terms & Conditions",
+      "description": "Legal terms for using the Olive Pizza website, app, and placing orders.",
+      "aiNavigation": "Say 'Terms and conditions' or 'Terms of service'."
+    },
+    {
+      "path": "/cancellation-policy",
+      "name": "Cancellation Policy",
+      "description": "How and when you can cancel an order, and what happens if you do.",
+      "aiNavigation": "Say 'Cancellation policy' or 'How do I cancel my order?'."
+    },
+    {
+      "path": "/delivery-policy",
+      "name": "Delivery Policy",
+      "description": "Delivery zones, estimated times, charges, and rules for Olive Pizza deliveries.",
+      "aiNavigation": "Say 'Delivery policy', 'Delivery area', or 'Do you deliver to [location]?'."
+    },
+    {
+      "path": "/login",
+      "name": "Login",
+      "description": "Sign in with Google, phone OTP, or email.",
+      "aiNavigation": "Say 'Login' or 'Sign in'."
+    },
+    {
+      "path": "/register",
+      "name": "Register",
+      "description": "Create a new Olive Pizza account.",
+      "aiNavigation": "Say 'Register' or 'Create account'."
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "_meta": {
+    "title": "Olive Pizza — Menu Structural Metadata",
+    "description": "IMPORTANT: Actual products, prices, coupons, and availability are pulled LIVE from Firestore. This file only contains static structural metadata (crust types, sizes, toppings schema). Do NOT hardcode product prices or names here.",
+    "source": "Firestore: products, categories, coupons collections (KnowledgeBaseService.ts)",
+    "lastUpdated": "2025-07-31"
+  },
+  "dietary_policy": {
+    "type": "100% Pure Vegetarian",
+    "description": "Olive Pizza is a 100% Pure Vegetarian restaurant. We do NOT serve any Non-Veg food — no Chicken, no Mutton, no Eggs, no Seafood of any kind.",
+    "emoji": "🟢",
+    "jain_friendly": "Jain-friendly options available on request (no onion, no garlic)."
+  },
+  "crust_options": [
+    {
+      "name": "Classic Hand Tossed",
+      "description": "Soft, chewy artisan crust — our most popular choice. Medium thickness.",
+      "extraCharge": 0,
+      "available": true
+    },
+    {
+      "name": "Cheese Burst",
+      "description": "Liquid cheddar and mozzarella oozes from inside the crust with every bite. Premium upgrade.",
+      "extraCharge": 75,
+      "available": true
+    },
+    {
+      "name": "Thin Crust",
+      "description": "Crispy, light Italian thin crust — great for a lighter meal.",
+      "extraCharge": 0,
+      "available": true
+    },
+    {
+      "name": "Pan Crust",
+      "description": "Thick fluffy golden pan crust — extra filling and hearty.",
+      "extraCharge": 30,
+      "available": true
+    }
+  ],
+  "size_options": [
+    {
+      "name": "Small",
+      "inches": 7,
+      "slices": 4,
+      "servings": "1 person",
+      "description": "Perfect for a solo meal or a quick snack."
+    },
+    {
+      "name": "Medium",
+      "inches": 10,
+      "slices": 6,
+      "servings": "2–3 people",
+      "description": "Our most popular size — great for sharing."
+    },
+    {
+      "name": "Large",
+      "inches": 12,
+      "slices": 8,
+      "servings": "3–4 people",
+      "description": "Best for families or a group meal."
+    }
+  ],
+  "extra_toppings": [
+    { "name": "Extra Cheese", "type": "premium", "priceRange": "₹30–₹49" },
+    { "name": "Fresh Paneer (Cottage Cheese)", "type": "premium", "priceRange": "₹40–₹59" },
+    { "name": "Jalapeños", "type": "spicy", "priceRange": "₹20–₹30" },
+    { "name": "Mushrooms", "type": "veg", "priceRange": "₹25–₹35" },
+    { "name": "Black Olives", "type": "premium", "priceRange": "₹25–₹35" },
+    { "name": "Capsicum (Bell Pepper)", "type": "veg", "priceRange": "₹20–₹30" },
+    { "name": "Sweet Corn", "type": "veg", "priceRange": "₹20–₹30" },
+    { "name": "Onions", "type": "veg", "priceRange": "₹15–₹25" },
+    { "name": "Tomatoes", "type": "veg", "priceRange": "₹15–₹25" },
+    { "name": "Spinach", "type": "healthy", "priceRange": "₹20–₹30" },
+    { "name": "Baby Corn", "type": "veg", "priceRange": "₹25–₹35" },
+    { "name": "Red Paprika", "type": "spicy", "priceRange": "₹20–₹30" }
+  ],
+  "ordering_rules": {
+    "minimum_order": "Shown live at checkout — pulled from Firestore settings.",
+    "delivery_charge": "Shown live at checkout — pulled from Firestore settings.",
+    "free_delivery_threshold": "Shown live in app — pulled from Firestore settings.",
+    "note": "All prices, availability, and current offers are fetched live from Firestore. Never use static values for order-critical information."
+  }
+}
