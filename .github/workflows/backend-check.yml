@@ -1,0 +1,94 @@
+name: Backend TypeScript and Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: olive_pizza_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://test_user:test_password@localhost:5432/olive_pizza_test
+      DATABASE_PROVIDER: local
+      REDIS_URL: redis://localhost:6379
+      PORT: 5175
+      NODE_ENV: test
+      PG_SSL: 'false'
+      DATABASE_ENV: testing
+      FIREBASE_PROJECT_ID: olive-pizza-08
+      FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npx tsc --noEmit
+
+      - name: Run database migrations
+        run: npx tsx src/migrations/runner.ts
+        env:
+          DATABASE_PROVIDER: local
+          DATABASE_URL: postgres://test_user:test_password@localhost:5432/olive_pizza_test
+          REDIS_URL: redis://localhost:6379
+          PG_SSL: 'false'
+          DATABASE_ENV: testing
+          NODE_ENV: test
+          FIREBASE_PROJECT_ID: olive-pizza-08
+          FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
+
+      - name: Run backend tests
+        run: npm test
+        env:
+          DATABASE_PROVIDER: local
+          DATABASE_URL: postgres://test_user:test_password@localhost:5432/olive_pizza_test
+          REDIS_URL: redis://localhost:6379
+          PG_SSL: 'false'
+          DATABASE_ENV: testing
+          NODE_ENV: test
+          FIREBASE_PROJECT_ID: olive-pizza-08
+          FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
