@@ -7,3 +7,11 @@ dist-ssr/
 logs/
 *.log
 cache/
+
+credentials/
+credentials/*.json
+.env
+.env.*
+scratch/
+
+.r2_mock/
