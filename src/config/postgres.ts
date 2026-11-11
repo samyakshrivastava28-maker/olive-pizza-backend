@@ -61,9 +61,9 @@ const isLayerbase = Boolean(!isLocalPostgres && (dbUrl?.includes('layerbase.dev'
 const isRenderPostgres = Boolean(!isLocalPostgres && (dbUrl?.includes('render.com') || dbUrl?.includes('dpg-') || DATABASE_PROVIDER === 'render-test'));
 const isCloudPostgres = Boolean(!isLocalPostgres && (isLayerbase || isRenderPostgres || dbUrl?.includes('supabase.co') || dbUrl?.includes('pooler.supabase.com')));
 
-const maxConnections = parseInt(process.env.POSTGRES_POOL_MAX || (isLayerbase ? '10' : '20'), 10);
-const idleTimeoutMillis = parseInt(process.env.POSTGRES_POOL_IDLE_TIMEOUT_MS || (isLayerbase ? '2000' : '30000'), 10);
-const connectionTimeoutMillis = parseInt(process.env.POSTGRES_POOL_CONN_TIMEOUT_MS || '10000', 10);
+const maxConnections = parseInt(process.env.POSTGRES_POOL_MAX || (isLayerbase ? '15' : '20'), 10);
+const idleTimeoutMillis = parseInt(process.env.POSTGRES_POOL_IDLE_TIMEOUT_MS || '30000', 10);
+const connectionTimeoutMillis = parseInt(process.env.POSTGRES_POOL_CONN_TIMEOUT_MS || '15000', 10);
 
 export const pgPool = new Pool({
   connectionString: dbUrl,
@@ -166,7 +166,7 @@ export async function query<T = any>(text: string, params: any[] = []): Promise<
     }
     return res;
   } catch (err: any) {
-    if (err.message?.includes('client_idle_timeout') || err.message?.includes('Connection terminated') || err.code === '08P01') {
+    if (err.message?.includes('client_idle_timeout') || err.message?.includes('Connection terminated') || err.message?.includes('timeout') || err.code === '08P01' || err.code === '57P01') {
       console.warn(`[PostgreSQL Pooler] Idle client connection expired (${err.message}). Retrying query with fresh socket...`);
       return await pgPool.query<T>(text, params);
     }

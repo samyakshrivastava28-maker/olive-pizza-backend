@@ -297,6 +297,7 @@ import healthStreamRoutes from './routes/health.stream.routes.js';
 // Direct core health & readiness probes
 app.use('/', healthRoutes);
 app.use('/api', healthRoutes);
+app.use('/health', healthRoutes);
 app.use('/health', healthStreamRoutes);
 
 // Public SEO Routes (Sitemap & Robots)

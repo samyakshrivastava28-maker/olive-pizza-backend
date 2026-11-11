@@ -17,3 +17,21 @@ export function calculateDistance(lat1: number, lon1: number, lat2: number, lon2
 function deg2rad(deg: number): number {
   return deg * (Math.PI/180);
 }
+
+export function withTimeout<T = any>(promise: Promise<T>, label: string, timeoutMs = 1500): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
+export function getIstDateKey(date: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(date);
+}
+
+export function getIstStartOfDay(date: Date = new Date()): Date {
+  const istDate = getIstDateKey(date);
+  return new Date(`${istDate}T00:00:00.000+05:30`);
+}

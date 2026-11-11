@@ -188,79 +188,11 @@ router.post('/authorize-app', verifyToken, async (req: AuthRequest, res: Respons
 
 // POST /api/auth/context-session - Owner Authorized Context Switching for Standalone Apps
 router.post('/context-session', verifyToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const user = req.user;
-    if (!user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
-    }
-
-    const isGlobalOwner = FranchiseScopeService.isGlobalOwner(user.email, user.role);
-    if (!isGlobalOwner) {
-      res.status(403).json({ error: 'Forbidden. Only platform Global Owner can create scoped management contexts.' });
-      return;
-    }
-
-    const { targetFranchiseId, targetBranchId, targetBranchName } = req.body;
-    const requestedTarget = (req.body.targetApp || req.body.context || 'franchise_management').toLowerCase();
-
-    if (requestedTarget === 'customer') {
-      res.status(403).json({ error: 'Forbidden: Owner accounts cannot generate context sessions for customer accounts.' });
-      return;
-    }
-
-    const effectiveFranchiseId = targetFranchiseId || 'fra_rajnandgaon';
-    const effectiveBranchId = targetBranchId || 'main_branch';
-
-    const targetApp = req.body.targetApp || req.body.context || 'franchise_management';
-
-    const tokenPayload = {
-      ownerUid: user.uid,
-      ownerEmail: user.email,
-      targetApp,
-      targetFranchiseId: effectiveFranchiseId,
-      targetBranchId: effectiveBranchId,
-      targetBranchName: targetBranchName || `Branch ${effectiveBranchId}`,
-      issuedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString() // 8 hour session
-    };
-
-    const secret = process.env.JWT_SECRET || process.env.TRACKING_TOKEN_SECRET || process.env.SESSION_SECRET;
-    if (!secret) {
-      res.status(500).json({ error: 'Server security configuration missing: signing secret is required.' });
-      return;
-    }
-
-    const payloadB64 = Buffer.from(JSON.stringify(tokenPayload)).toString('base64url');
-    const signature = crypto.createHmac('sha256', secret).update(payloadB64).digest('base64url');
-    const sessionKey = `${payloadB64}.${signature}`;
-
-    const franchiseBaseUrl = process.env.FRANCHISE_URL || 'https://franchise.olivepizza.in';
-    const managerBaseUrl = process.env.MANAGER_URL || 'https://manager.olivepizza.in';
-    const posBaseUrl = process.env.POS_URL || 'https://pos.olivepizza.in';
-    const deliveryBaseUrl = process.env.DELIVERY_URL || 'https://delivery.olivepizza.in';
-
-    let targetUrl = managerBaseUrl;
-    if (requestedTarget === 'franchise' || requestedTarget === 'franchise_management') {
-      targetUrl = `${franchiseBaseUrl}?context=${sessionKey}&franchiseId=${encodeURIComponent(tokenPayload.targetFranchiseId)}`;
-    } else if (requestedTarget === 'pos') {
-      targetUrl = `${posBaseUrl}?context=${sessionKey}&branchId=${encodeURIComponent(tokenPayload.targetBranchId)}&franchiseId=${encodeURIComponent(tokenPayload.targetFranchiseId)}`;
-    } else if (requestedTarget === 'delivery' || requestedTarget === 'delivery_rider' || requestedTarget === 'delivery_partner') {
-      targetUrl = `${deliveryBaseUrl}?context=${sessionKey}&branchId=${encodeURIComponent(tokenPayload.targetBranchId)}`;
-    } else {
-      targetUrl = `${managerBaseUrl}?context=${sessionKey}&branchId=${encodeURIComponent(tokenPayload.targetBranchId)}&branchName=${encodeURIComponent(tokenPayload.targetBranchName)}`;
-    }
-
-    res.json({
-      success: true,
-      sessionKey,
-      targetUrl,
-      context: tokenPayload
-    });
-  } catch (error: any) {
-    console.error('[Auth] Error generating context session:', error);
-    res.status(500).json({ error: error?.message || 'Failed to generate context session' });
-  }
+  res.status(403).json({
+    success: false,
+    code: 'CROSS_APP_CONTEXT_SWITCH_DISABLED',
+    error: 'Cross-app and cross-franchise switching is disabled. Use your dedicated franchise/branch management account or view franchises inside the Owner Portal.'
+  });
 });
 
 // POST /api/auth/verify-context-session - Cryptographically verify scoped context token

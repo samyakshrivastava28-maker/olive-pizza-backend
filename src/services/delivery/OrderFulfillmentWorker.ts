@@ -8,6 +8,7 @@
  */
 
 import { query } from '../../lib/db.js';
+import { withTimeout } from '../../lib/utils.js';
 import { adminDb } from '../../config/firebase.js';
 import { RiderDispatchEngine } from './RiderDispatchEngine.js';
 import { notificationEngine } from '../notification/NotificationEngine.js';
@@ -54,37 +55,62 @@ export class OrderFulfillmentWorker {
   private static async processPendingDispatches() {
     const now = new Date();
     const nowMs = now.getTime();
+    const dispatchedIds = new Set<string>();
 
-    // Query active delivery orders from Firestore that are accepted or preparing and lack an assigned partner
+    // 1. Authoritative PostgreSQL dispatch scan (quota-proof: T-3m readiness or already READY)
     try {
-      const snap = await adminDb.collection('orders')
-        .where('status', 'in', ['accepted', 'preparing'])
-        .get()
-        .catch(() => ({ docs: [] } as any));
+      const pgRes = await query(`
+        SELECT id, order_status, expected_ready_at
+        FROM canonical_orders
+        WHERE order_status IN ('ACCEPTED', 'PREPARING', 'READY')
+          AND delivery_partner_id IS NULL
+          AND COALESCE(LOWER(order_type), 'delivery') = 'delivery'
+          AND (
+            order_status = 'READY'
+            OR (expected_ready_at IS NOT NULL AND expected_ready_at <= NOW() + INTERVAL '3 minutes')
+          )
+        ORDER BY created_at ASC
+        LIMIT 50
+      `);
+
+      for (const row of pgRes.rows) {
+        dispatchedIds.add(row.id);
+        console.log(`[OrderFulfillmentWorker] Dispatching rider for order ${row.id} (PG ${row.order_status}, readiness window reached)`);
+        await RiderDispatchEngine.autoDispatchRider(row.id).catch((err: any) => {
+          console.warn(`[OrderFulfillmentWorker] Auto-dispatch notice for ${row.id}:`, err.message);
+        });
+      }
+    } catch (pgErr: any) {
+      console.warn('[OrderFulfillmentWorker] PG dispatch scan notice:', pgErr.message);
+    }
+
+    // 2. Bounded Firestore fallback scan (for unmigrated docs not in PG)
+    try {
+      const snap = await withTimeout(
+        adminDb.collection('orders')
+          .where('status', 'in', ['accepted', 'preparing'])
+          .get(),
+        'worker.pendingDispatches',
+        1500
+      ).catch(() => ({ docs: [] } as any));
 
       for (const doc of snap.docs) {
         const order = doc.data();
         const orderId = doc.id;
+        if (dispatchedIds.has(orderId)) continue;
 
-        // Skip non-delivery orders
         const fulfillment = (order.fulfillmentType || order.deliveryType || 'delivery').toLowerCase();
         if (fulfillment !== 'delivery') continue;
-
-        // Skip if already has an assigned partner
         if (order.deliveryPartnerId || order.riderId) continue;
 
-        // Check authoritative readyAt
         const readyAtStr = order.expectedReadyAt || order.estimatedReadyAt;
         if (!readyAtStr) continue;
 
         const readyMs = new Date(readyAtStr).getTime();
         if (isNaN(readyMs)) continue;
 
-        // Dispatch window: 3 minutes before readiness
-        const dispatchThresholdMs = readyMs - 3 * 60 * 1000;
-
-        if (nowMs >= dispatchThresholdMs) {
-          console.log(`[OrderFulfillmentWorker] Dispatching rider for order ${orderId} (T-3m readiness reached)`);
+        if (nowMs >= readyMs - 3 * 60 * 1000) {
+          console.log(`[OrderFulfillmentWorker] Dispatching rider for order ${orderId} (Firestore T-3m readiness reached)`);
           await RiderDispatchEngine.autoDispatchRider(orderId).catch((err: any) => {
             console.warn(`[OrderFulfillmentWorker] Auto-dispatch notice for ${orderId}:`, err.message);
           });
@@ -104,9 +130,9 @@ export class OrderFulfillmentWorker {
 
     try {
       // Find orders in progress that have an ETA, have exceeded it, and haven't had an alert sent
-      const snap = await adminDb.collection('orders')
+      const snap = await withTimeout(adminDb.collection('orders')
         .where('status', 'in', ['accepted', 'preparing', 'ready', 'partner_assigned', 'picked_up', 'out_for_delivery'])
-        .get()
+        .get(), 'worker.lateAlerts', 1500)
         .catch(() => ({ docs: [] } as any));
 
       for (const doc of snap.docs) {
@@ -148,11 +174,7 @@ export class OrderFulfillmentWorker {
         if (!claimed) continue;
 
         // Persist to PostgreSQL canonical_orders
-        await query(`
-          UPDATE canonical_orders
-          SET late_alert_sent_at = NOW(), updated_at = NOW()
-          WHERE id = $1 AND late_alert_sent_at IS NULL
-        `, [orderId]).catch(() => {});
+        // Late-alert dedup is tracked in-memory via this.sentAlerts (canonical_orders has no late_alert_sent_at column)
 
         console.log(`🚨 [OrderFulfillmentWorker] Emitting 1-time late delivery alert for order ${orderId}`);
 

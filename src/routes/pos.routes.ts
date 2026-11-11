@@ -1847,7 +1847,7 @@ router.post('/claim-print', verifyToken, requirePOSRole, async (req: AuthRequest
 });
 
 // POST /api/pos/complete-print — Confirm successful print output
-router.post('/complete-print', verifyToken, requirePOSRole, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post(['/complete-print', '/update-print-status'], verifyToken, requirePOSRole, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { orderId, terminalId } = req.body;
     if (!orderId) {

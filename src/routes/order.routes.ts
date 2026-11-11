@@ -17,7 +17,7 @@ import { DeliveryCapacityService } from '../services/delivery/DeliveryCapacitySe
 import { FranchiseGoogleSheetsService } from '../services/reports/FranchiseGoogleSheetsService.js';
 import { CanonicalOrderService } from '../services/pos/CanonicalOrderService.js';
 import { BillingNumberService } from '../services/pos/BillingNumberService.js';
-import { calculateDistance } from '../lib/utils.js';
+import { calculateDistance, withTimeout } from '../lib/utils.js';
 import { CustomerOrderingContextService } from '../services/order/CustomerOrderingContextService.js';
 import { OrderPersistenceArchiveService } from '../services/order/OrderPersistenceArchiveService.js';
 import { AuthoritativePricingResolver } from '../services/menu/AuthoritativePricingResolver.js';
@@ -33,6 +33,9 @@ function getLocalDateString(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: RESTAURANT_TIMEZONE })
     .format(new Date());
 }
+
+/** Bounds best-effort Firestore projection/fallback operations so quota retries never stall HTTP responses. */
+const withFirestoreTimeout = withTimeout;
 
 /**
  * Atomically increments the daily order counter in Firestore and returns
@@ -65,38 +68,162 @@ router.get('/', verifyToken, async (req: AuthRequest, res: Response): Promise<vo
     }
 
     const role = (user.role || 'customer').toLowerCase();
-    const isStaff = ['restaurant_manager', 'manager', 'owner', 'developer', 'admin', 'platform_owner', 'kitchen_staff', 'cashier'].includes(role) ||
-      user.email === 'olivepizzarjn@gmail.com' ||
-      user.email === 'webhub2811@gmail.com';
+    const isStaff = ['restaurant_manager', 'manager', 'owner', 'developer', 'admin', 'platform_owner', 'kitchen_staff', 'cashier', 'franchise_owner', 'franchise_manager'].includes(role) ||
+      user.isGlobalOwner === true;
+
+    const branchAliases = (b: string): string[] =>
+      (b === 'main_branch' || b === 'branch_rjn_main') ? ['main_branch', 'branch_rjn_main'] : [b];
 
     if (isStaff) {
       const scope = FranchiseScopeService.resolveScope(user);
-      const requestedBranchId = (req.query.branchId as string) || (scope.isGlobalOwner ? 'all' : (scope.branchId || ''));
+      const requestedFranchiseId = ((req.query.franchiseId as string) || '').trim();
+      const requestedBranchId = (req.query.branchId as string) || (scope.isGlobalOwner || scope.isFranchiseOwner ? 'all' : (scope.branchId || ''));
       const effectiveBranchId = FranchiseScopeService.getEffectiveBranchId(scope, requestedBranchId);
+      const limitCount = Math.min(300, Math.max(20, Number(req.query.limit) || 100));
 
-      let q: any = adminDb.collection('orders');
-      if (effectiveBranchId !== 'all') {
-        q = q.where('branchId', '==', effectiveBranchId);
+      const orderMap = new Map<string, any>();
+
+      // Authoritative Primary Query: PostgreSQL canonical_orders
+      try {
+        const { query: pgQuery } = await import('../config/postgres.js');
+        const pgParams: any[] = [];
+        const clauses: string[] = [];
+
+        if (effectiveBranchId !== 'all') {
+          pgParams.push(branchAliases(effectiveBranchId));
+          clauses.push(`o.branch_id = ANY($${pgParams.length}::text[])`);
+        }
+        if (scope.isFranchiseOwner && scope.franchiseId) {
+          pgParams.push(scope.franchiseId);
+          clauses.push(`o.franchise_id = $${pgParams.length}`);
+        } else if (scope.isGlobalOwner && requestedFranchiseId && requestedFranchiseId !== 'all') {
+          pgParams.push(requestedFranchiseId);
+          clauses.push(`o.franchise_id = $${pgParams.length}`);
+        }
+        const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+        pgParams.push(limitCount);
+
+        const pgRes = await pgQuery(
+          `SELECT o.*, rb.name AS branch_name,
+             COALESCE(
+               json_agg(
+                 json_build_object(
+                   'id', i.id,
+                   'menuItemId', i.menu_item_id,
+                   'name', i.item_name,
+                   'size', i.size_variant,
+                   'crust', i.crust,
+                   'quantity', i.quantity,
+                   'unitPrice', i.unit_price,
+                   'price', i.unit_price,
+                   'lineTotal', i.line_total,
+                   'addons', i.addons_json
+                 )
+               ) FILTER (WHERE i.id IS NOT NULL),
+               '[]'::json
+             ) AS items
+           FROM canonical_orders o
+           LEFT JOIN restaurant_branches rb ON rb.id = o.branch_id
+           LEFT JOIN canonical_order_items i ON o.id = i.order_id
+           ${whereSql}
+           GROUP BY o.id, rb.name
+           ORDER BY o.created_at DESC
+           LIMIT $${pgParams.length}`,
+          pgParams
+        );
+
+        for (const r of pgRes.rows) {
+          const normalized = {
+            id: r.id,
+            orderId: r.id,
+            userId: r.customer_id || null,
+            customerId: r.customer_id || null,
+            permanentBillNo: r.permanent_bill_no ? parseInt(r.permanent_bill_no, 10) : undefined,
+            billNumber: r.permanent_bill_no ? `#${r.permanent_bill_no}` : undefined,
+            dailyOrderNumber: r.daily_order_no ? parseInt(r.daily_order_no, 10) : undefined,
+            orderNumber: r.daily_order_no ? `#${r.daily_order_no}` : `#${String(r.id).slice(0, 6).toUpperCase()}`,
+            status: (r.order_status || 'pending').toLowerCase(),
+            orderStatus: r.order_status,
+            orderSource: r.order_source,
+            fulfillmentType: r.order_type,
+            deliveryType: r.order_type,
+            paymentMethod: r.payment_method,
+            paymentStatus: r.payment_status,
+            customerName: r.customer_name,
+            contactPhone: r.customer_phone,
+            customerPhone: r.customer_phone,
+            deliveryAddress: typeof r.delivery_address === 'string' ? { addressLine: r.delivery_address } : r.delivery_address,
+            items: Array.isArray(r.items) ? r.items : [],
+            subtotal: Number(r.subtotal || 0),
+            discountAmount: Number(r.discount_amount || 0),
+            taxes: Number(r.tax_amount || 0),
+            cgst: Number(r.cgst || 0),
+            sgst: Number(r.sgst || 0),
+            deliveryFee: Number(r.delivery_fee || 0),
+            totalAmount: Number(r.total_amount || 0),
+            branchId: r.branch_id,
+            branchName: r.branch_name || 'Olive Pizza',
+            franchiseId: r.franchise_id,
+            deliveryPartnerId: r.delivery_partner_id || null,
+            deliveryPartnerName: r.delivery_partner_name || null,
+            deliveryPartnerPhone: r.delivery_partner_phone || null,
+            partnerAssignedAt: r.partner_assigned_at || null,
+            estimatedPreparationMinutes: r.estimated_preparation_minutes != null ? Number(r.estimated_preparation_minutes) : null,
+            expectedReadyAt: r.expected_ready_at || null,
+            acceptedAt: r.accepted_at || null,
+            preparationStartedAt: r.preparation_started_at || null,
+            readyAt: r.ready_at || null,
+            deliveredAt: r.delivered_at || null,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at || r.created_at,
+          };
+          orderMap.set(r.id, OrderProjectionService.projectByRole(normalized, user));
+        }
+      } catch (pgErr: any) {
+        console.warn('[Orders] PostgreSQL staff orders query notice:', pgErr.message);
       }
 
-      const snapshot = await q.orderBy('createdAt', 'desc').limit(100).get().catch(async () => {
-        // Fallback without index if orderBy fails
-        let fallbackQ: any = adminDb.collection('orders');
+      // Secondary merge from Firestore only for orders missing from PG
+      try {
+        let q: any = adminDb.collection('orders');
         if (effectiveBranchId !== 'all') {
-          fallbackQ = fallbackQ.where('branchId', '==', effectiveBranchId);
+          q = q.where('branchId', '==', effectiveBranchId);
+        } else if (scope.isFranchiseOwner && scope.franchiseId) {
+          q = q.where('franchiseId', '==', scope.franchiseId);
         }
-        return await fallbackQ.limit(100).get();
-      });
 
-      const orders = snapshot.docs.map((doc: any) => {
-        return OrderProjectionService.projectByRole({ id: doc.id, ...doc.data() }, user);
-      });
+        const snapshot = await q.orderBy('createdAt', 'desc').limit(limitCount).get().catch(async () => {
+          let fallbackQ: any = adminDb.collection('orders');
+          if (effectiveBranchId !== 'all') {
+            fallbackQ = fallbackQ.where('branchId', '==', effectiveBranchId);
+          } else if (scope.isFranchiseOwner && scope.franchiseId) {
+            fallbackQ = fallbackQ.where('franchiseId', '==', scope.franchiseId);
+          }
+          return await fallbackQ.limit(limitCount).get();
+        });
 
+        for (const doc of snapshot.docs || []) {
+          if (!orderMap.has(doc.id)) {
+            const rawDoc = { id: doc.id, ...doc.data() };
+            if (scope.isFranchiseOwner && scope.franchiseId && rawDoc.franchiseId && rawDoc.franchiseId !== scope.franchiseId) {
+              continue;
+            }
+            orderMap.set(doc.id, OrderProjectionService.projectByRole(rawDoc, user));
+          }
+        }
+      } catch (fsErr: any) {
+        console.warn('[Orders] Firestore staff orders fallback notice:', fsErr.message);
+      }
+
+      const orders = Array.from(orderMap.values()).sort((a: any, b: any) =>
+        new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+      );
       res.json(orders);
       return;
     }
 
-    // Normal customer: fetch both active Firestore orders and archived PostgreSQL orders
+    // Normal customer: Query both PostgreSQL (authoritative status/prep) and Firestore
+    const pgHistorical = await OrderPersistenceArchiveService.getCustomerHistoricalOrders(user.uid, (user as any).phone || (user as any).phone_number).catch(() => []);
     let snapshotDocs: any[] = [];
     try {
       const snap = await adminDb.collection('orders')
@@ -109,23 +236,40 @@ router.get('/', verifyToken, async (req: AuthRequest, res: Response): Promise<vo
         });
       snapshotDocs = snap?.docs || [];
     } catch (fsErr: any) {
-      console.warn('[Orders] Firestore read notice for customer orders, falling back to PostgreSQL:', fsErr.message);
+      console.warn('[Orders] Firestore read notice for customer orders, using PostgreSQL:', fsErr.message);
     }
 
-    const pgHistorical = await OrderPersistenceArchiveService.getCustomerHistoricalOrders(user.uid, (user as any).phone || (user as any).phone_number).catch(() => []);
-      
-    const activeOrders = snapshotDocs
-      .map((doc: any) => OrderProjectionService.projectForCustomer(doc.data(), user.uid, doc.id))
-      .filter(Boolean);
+    const pgById = new Map<string, any>();
+    for (const po of (pgHistorical || [])) {
+      pgById.set(po.id, po);
+    }
 
+    const mergedById = new Map<string, any>();
+    // First seed Firestore docs merged with authoritative PG status/timing/rider if PG also has them
+    for (const doc of snapshotDocs) {
+      const fsRaw = { id: doc.id, ...doc.data() };
+      const pgRow = pgById.get(doc.id);
+      const mergedRaw = pgRow ? {
+        ...fsRaw,
+        ...pgRow,
+        items: (Array.isArray(pgRow.items) && pgRow.items.length > 0) ? pgRow.items : fsRaw.items,
+        deliveryAddress: fsRaw.deliveryAddress?.addressLine ? fsRaw.deliveryAddress : pgRow.deliveryAddress,
+      } : fsRaw;
+      const projected = OrderProjectionService.projectForCustomer(mergedRaw, user.uid, doc.id);
+      if (projected) mergedById.set(doc.id, projected);
+    }
 
-    const activeIds = new Set(activeOrders.map((o: any) => o.id));
-    const pastOrders = (pgHistorical || [])
-      .filter((po: any) => !activeIds.has(po.id))
-      .map((po: any) => OrderProjectionService.projectForCustomer(po, user.uid, po.id))
-      .filter(Boolean);
+    // Add remaining PG orders (active or historical) not present in Firestore
+    for (const po of (pgHistorical || [])) {
+      if (!mergedById.has(po.id)) {
+        const projected = OrderProjectionService.projectForCustomer(po, user.uid, po.id);
+        if (projected) mergedById.set(po.id, projected);
+      }
+    }
 
-    const combined = [...activeOrders, ...pastOrders];
+    const combined = Array.from(mergedById.values()).sort((a: any, b: any) =>
+      new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
     res.json(combined);
   } catch (error) {
     console.error("[Orders] Failed to fetch orders:", error);
@@ -143,66 +287,146 @@ router.get('/live', verifyToken, requireRole(['restaurant_manager', 'owner', 'ki
     }
 
     const scope = FranchiseScopeService.resolveScope(user);
-    const requestedBranchId = (req.query.branchId as string) || (scope.isGlobalOwner ? 'all' : (scope.branchId || ''));
+    const requestedBranchId = (req.query.branchId as string) || (scope.isGlobalOwner || scope.isFranchiseOwner ? 'all' : (scope.branchId || ''));
     const effectiveBranchId = FranchiseScopeService.getEffectiveBranchId(scope, requestedBranchId);
 
     const activeStatuses = ['pending', 'pending_acceptance', 'accepted', 'preparing', 'ready', 'partner_assigned', 'picked_up', 'out_for_delivery'];
+    const branchAliases = (b: string): string[] =>
+      (b === 'main_branch' || b === 'branch_rjn_main') ? ['main_branch', 'branch_rjn_main'] : [b];
 
-    let q: any = adminDb.collection('orders');
-    if (effectiveBranchId !== 'all') {
-      q = q.where('branchId', '==', effectiveBranchId);
+    const liveMap = new Map<string, any>();
+
+    // Authoritative Primary Query: PostgreSQL canonical_orders with items + branch
+    try {
+      const { query: pgQuery } = await import('../config/postgres.js');
+      const pgParams: any[] = [];
+      let branchClause = '';
+      if (effectiveBranchId !== 'all') {
+        pgParams.push(branchAliases(effectiveBranchId));
+        branchClause += ` AND o.branch_id = ANY($${pgParams.length}::text[])`;
+      }
+      if (scope.isFranchiseOwner && scope.franchiseId) {
+        pgParams.push(scope.franchiseId);
+        branchClause += ` AND o.franchise_id = $${pgParams.length}`;
+      }
+      const pgRes = await pgQuery(
+        `SELECT o.*, rb.name AS branch_name,
+           COALESCE(
+             json_agg(
+               json_build_object(
+                 'id', i.id,
+                 'menuItemId', i.menu_item_id,
+                 'name', i.item_name,
+                 'size', i.size_variant,
+                 'crust', i.crust,
+                 'quantity', i.quantity,
+                 'unitPrice', i.unit_price,
+                 'price', i.unit_price,
+                 'lineTotal', i.line_total,
+                 'addons', i.addons_json
+               )
+             ) FILTER (WHERE i.id IS NOT NULL),
+             '[]'::json
+           ) AS items
+         FROM canonical_orders o
+         LEFT JOIN restaurant_branches rb ON rb.id = o.branch_id
+         LEFT JOIN canonical_order_items i ON o.id = i.order_id
+         WHERE o.order_status NOT IN ('DELIVERED', 'CANCELLED', 'REJECTED', 'VOIDED') ${branchClause}
+         GROUP BY o.id, rb.name
+         ORDER BY o.created_at DESC LIMIT 100`,
+        pgParams
+      );
+      for (const r of pgRes.rows) {
+        const rawOrder = {
+          id: r.id,
+          orderId: r.id,
+          orderNumber: r.daily_order_no ? `#${r.daily_order_no}` : `#${String(r.id).slice(0, 6).toUpperCase()}`,
+          dailyOrderNumber: r.daily_order_no ? parseInt(r.daily_order_no, 10) : undefined,
+          status: (r.order_status || 'pending').toLowerCase(),
+          branchId: r.branch_id,
+          branchName: r.branch_name || 'Olive Pizza',
+          franchiseId: r.franchise_id,
+          customerName: r.customer_name,
+          contactPhone: r.customer_phone,
+          deliveryAddress: typeof r.delivery_address === 'string' ? { addressLine: r.delivery_address } : r.delivery_address,
+          fulfillmentType: r.order_type || 'delivery',
+          deliveryType: r.order_type || 'delivery',
+          items: Array.isArray(r.items) ? r.items : [],
+          subtotal: Number(r.subtotal || 0),
+          discountAmount: Number(r.discount_amount || 0),
+          taxes: Number(r.tax_amount || 0),
+          cgst: Number(r.cgst || 0),
+          sgst: Number(r.sgst || 0),
+          deliveryFee: Number(r.delivery_fee || 0),
+          totalAmount: Number(r.total_amount || 0),
+          paymentMethod: r.payment_method,
+          paymentStatus: r.payment_status,
+          deliveryPartnerId: r.delivery_partner_id || null,
+          deliveryPartnerName: r.delivery_partner_name || null,
+          deliveryPartnerPhone: r.delivery_partner_phone || null,
+          partnerAssignedAt: r.partner_assigned_at || null,
+          estimatedPreparationMinutes: r.estimated_preparation_minutes != null ? Number(r.estimated_preparation_minutes) : null,
+          expectedReadyAt: r.expected_ready_at || null,
+          acceptedAt: r.accepted_at || null,
+          preparationStartedAt: r.preparation_started_at || null,
+          readyAt: r.ready_at || null,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at || r.created_at
+        };
+        const projected = OrderProjectionService.projectForRestaurantManager(rawOrder, r.id);
+        if (activeStatuses.includes(projected.status)) {
+          liveMap.set(r.id, {
+            ...projected,
+            franchiseId: r.franchise_id,
+            estimatedPreparationMinutes: rawOrder.estimatedPreparationMinutes,
+            expectedReadyAt: rawOrder.expectedReadyAt,
+          });
+        }
+      }
+    } catch (pgErr: any) {
+      console.warn('[Orders] PostgreSQL /live query notice:', pgErr.message);
     }
 
-    let activeOrders: any[] = [];
+    // Secondary merge: Firestore live docs not yet present in PG
     try {
+      let q: any = adminDb.collection('orders');
+      if (effectiveBranchId !== 'all') {
+        q = q.where('branchId', '==', effectiveBranchId);
+      } else if (scope.isFranchiseOwner && scope.franchiseId) {
+        q = q.where('franchiseId', '==', scope.franchiseId);
+      }
+
       const snapshot = await q.orderBy('createdAt', 'desc').limit(50).get().catch(async () => {
         let fallbackQ: any = adminDb.collection('orders');
         if (effectiveBranchId !== 'all') {
           fallbackQ = fallbackQ.where('branchId', '==', effectiveBranchId);
+        } else if (scope.isFranchiseOwner && scope.franchiseId) {
+          fallbackQ = fallbackQ.where('franchiseId', '==', scope.franchiseId);
         }
         return await fallbackQ.limit(50).get().catch(() => ({ docs: [] }));
       });
 
-      activeOrders = (snapshot?.docs || [])
-        .map((doc: any) => OrderProjectionService.projectForRestaurantManager(doc.data(), doc.id))
-        .filter((o: any) => activeStatuses.includes(o.status));
+      for (const doc of (snapshot?.docs || [])) {
+        if (!liveMap.has(doc.id)) {
+          const raw = doc.data();
+          const projected = OrderProjectionService.projectForRestaurantManager(raw, doc.id);
+          if (activeStatuses.includes(projected.status)) {
+            liveMap.set(doc.id, {
+              ...projected,
+              franchiseId: raw.franchiseId,
+              estimatedPreparationMinutes: raw.estimatedPreparationMinutes ?? null,
+              expectedReadyAt: raw.expectedReadyAt || raw.estimatedReadyAt || null,
+            });
+          }
+        }
+      }
     } catch (fsErr: any) {
-      console.warn('[Orders] Firestore read notice for /live, querying PostgreSQL:', fsErr.message);
+      console.warn('[Orders] Firestore read notice for /live:', fsErr.message);
     }
 
-    // Authoritative fallback: Query PostgreSQL canonical_orders directly
-    if (activeOrders.length === 0) {
-      try {
-        const { query: pgQuery } = await import('../config/postgres.js');
-        const pgParams: any[] = [];
-        let branchClause = '';
-        if (effectiveBranchId !== 'all') {
-          pgParams.push(effectiveBranchId);
-          branchClause = `AND branch_id = $${pgParams.length}`;
-        }
-        const pgRes = await pgQuery(
-          `SELECT * FROM canonical_orders 
-           WHERE order_status NOT IN ('DELIVERED', 'CANCELLED') ${branchClause} 
-           ORDER BY created_at DESC LIMIT 50`,
-          pgParams
-        );
-        activeOrders = pgRes.rows.map((r: any) => ({
-          id: r.id,
-          orderNumber: r.daily_order_no ? `#${r.daily_order_no}` : r.id?.slice(0, 6),
-          status: (r.order_status || 'pending').toLowerCase(),
-          customerName: r.customer_name,
-          customerPhone: r.customer_phone,
-          deliveryAddress: typeof r.delivery_address === 'string' ? { addressLine: r.delivery_address } : r.delivery_address,
-          totalAmount: Number(r.total_amount || 0),
-          paymentMethod: r.payment_method,
-          paymentStatus: r.payment_status,
-          createdAt: r.created_at,
-          branchId: r.branch_id
-        }));
-      } catch (pgErr: any) {
-        console.warn('[Orders] PostgreSQL /live query notice:', pgErr.message);
-      }
-    }
+    const activeOrders = Array.from(liveMap.values()).sort((a: any, b: any) =>
+      new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
 
     res.json({ success: true, count: activeOrders.length, orders: activeOrders });
 
@@ -303,10 +527,7 @@ router.get('/bill/:billReference', verifyToken, async (req: AuthRequest, res: Re
     const isStaff = [
       'restaurant_manager', 'manager', 'owner', 'developer', 'admin',
       'platform_owner', 'kitchen_staff', 'cashier', 'franchise_manager', 'franchise_owner'
-    ].includes(role) ||
-      user.email === 'olivepizzarjn@gmail.com' ||
-      user.email === 'webhub2811@gmail.com' ||
-      user.email === 'olivepizzamaker@gmail.com';
+    ].includes(role) || user.isGlobalOwner === true;
 
     const orderOwnerUid = orderDoc.userId || orderDoc.user_id;
 
@@ -438,21 +659,29 @@ router.get('/:id', verifyToken, async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    let data: any = null;
+    // Authoritative Primary Lookup: PostgreSQL canonical ledger first
+    let data: any = await OrderPersistenceArchiveService.getHistoricalOrder(id).catch(() => null);
+    let fsData: any = null;
     try {
       const docSnap = await adminDb.collection('orders').doc(id).get();
       if (docSnap.exists) {
-        data = { id: docSnap.id, ...docSnap.data() };
+        fsData = { id: docSnap.id, ...docSnap.data() };
       }
     } catch (fsErr: any) {
-      console.warn('[Orders] Firestore single order read notice, falling back to PostgreSQL:', fsErr.message);
+      console.warn('[Orders] Firestore single order read notice:', fsErr.message);
     }
 
-    if (!data) {
-      // Fallback: check PostgreSQL canonical archive for completed/archived order
-      data = await OrderPersistenceArchiveService.getHistoricalOrder(id);
+    if (data && fsData) {
+      // Preserve optional Firestore presentation metadata while keeping PG status/prep/rider authoritative
+      data = {
+        ...fsData,
+        ...data,
+        items: (Array.isArray(data.items) && data.items.length > 0) ? data.items : fsData.items,
+        deliveryAddress: fsData.deliveryAddress?.addressLine ? fsData.deliveryAddress : data.deliveryAddress,
+      };
+    } else if (!data && fsData) {
+      data = fsData;
     }
-
 
     if (!data) {
       res.status(404).json({ error: 'Order not found' });
@@ -762,61 +991,127 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
 
     // 0. Enforce 1 active order per customer policy
     try {
-      const existingOrdersSnap = await adminDb.collection('orders')
-        .where('userId', '==', userId)
-        .get();
+      // 0a. Check PostgreSQL canonical orders (Authoritative source of truth)
+      const pgActiveRes = await query(
+        `SELECT id, order_status, daily_order_no 
+         FROM canonical_orders 
+         WHERE (customer_id = $1 OR customer_id = $2) 
+           AND UPPER(order_status) NOT IN ('DELIVERED', 'CANCELLED', 'REJECTED', 'FAILED') 
+         ORDER BY created_at DESC LIMIT 1`,
+        [userId, (req.user as any)?.uid || userId]
+      );
 
-      const activeOrderDoc = existingOrdersSnap.docs.find(doc => {
-        const d = doc.data();
-        const status = (d.status || '').toLowerCase();
-        return !['delivered', 'cancelled', 'rejected', 'failed'].includes(status);
-      });
+      if (pgActiveRes.rows.length > 0) {
+        const activeRow = pgActiveRes.rows[0];
+        const orderNum = activeRow.daily_order_no ? `#${activeRow.daily_order_no}` : `#${activeRow.id.slice(0, 6)}`;
+        res.status(400).json({ 
+          error: `You already have an active order in progress (${orderNum}). Please wait until your current order is delivered before placing another order.`,
+          code: 'ACTIVE_ORDER_EXISTS',
+          activeOrderId: activeRow.id,
+          activeOrderStatus: activeRow.order_status
+        });
+        return;
+      }
 
-      if (activeOrderDoc) {
-        const activeData = activeOrderDoc.data();
-        // Cross-verify with PostgreSQL canonical table to ensure this order wasn't already delivered
-        let isActuallyDeliveredInPg = false;
-        try {
-          const pgCheck = await query(
-            `SELECT order_status FROM canonical_orders WHERE id = $1 LIMIT 1`,
-            [activeOrderDoc.id]
-          );
-          if (pgCheck.rows.length > 0) {
-            const pgStatus = (pgCheck.rows[0].order_status || '').toUpperCase();
-            if (pgStatus === 'DELIVERED' || pgStatus === 'CANCELLED') {
-              isActuallyDeliveredInPg = true;
-              // Clean up Firestore doc state
-              await adminDb.collection('orders').doc(activeOrderDoc.id).update({
-                status: pgStatus.toLowerCase(),
-                order_status: pgStatus,
-                live_lifecycle: 'TERMINAL'
-              }).catch(() => {});
+      // 0b. Secondary check against Firestore projection (bounded so quota retries never stall checkout)
+      try {
+        const existingOrdersSnap = await withFirestoreTimeout(
+          adminDb.collection('orders').where('userId', '==', userId).get(),
+          'activeOrdersCheck',
+          1500
+        );
+
+        const activeOrderDoc = existingOrdersSnap.docs.find(doc => {
+          const d = doc.data();
+          const status = (d.status || '').toLowerCase();
+          return !['delivered', 'cancelled', 'rejected', 'failed'].includes(status);
+        });
+
+        if (activeOrderDoc) {
+          const activeData = activeOrderDoc.data();
+          // Cross-verify with PostgreSQL canonical table to ensure this order wasn't already delivered
+          let isActuallyDeliveredInPg = false;
+          try {
+            const pgCheck = await query(
+              `SELECT order_status FROM canonical_orders WHERE id = $1 LIMIT 1`,
+              [activeOrderDoc.id]
+            );
+            if (pgCheck.rows.length > 0) {
+              const pgStatus = (pgCheck.rows[0].order_status || '').toUpperCase();
+              if (pgStatus === 'DELIVERED' || pgStatus === 'CANCELLED') {
+                isActuallyDeliveredInPg = true;
+                // Clean up Firestore doc state
+                await adminDb.collection('orders').doc(activeOrderDoc.id).update({
+                  status: pgStatus.toLowerCase(),
+                  order_status: pgStatus,
+                  live_lifecycle: 'TERMINAL'
+                }).catch(() => {});
+              }
             }
-          }
-        } catch {}
+          } catch {}
 
-        if (!isActuallyDeliveredInPg) {
-          const orderNum = activeData.dailyOrderNumber ? `#${activeData.dailyOrderNumber}` : `#${activeOrderDoc.id.slice(0, 6)}`;
-          res.status(400).json({ 
-            error: `You already have an active order in progress (${orderNum}). Please wait until your current order is delivered before placing another order.`,
-            code: 'ACTIVE_ORDER_EXISTS',
-            activeOrderId: activeOrderDoc.id,
-            activeOrderStatus: activeData.status
-          });
-          return;
+          if (!isActuallyDeliveredInPg) {
+            const orderNum = activeData.dailyOrderNumber ? `#${activeData.dailyOrderNumber}` : `#${activeOrderDoc.id.slice(0, 6)}`;
+            res.status(400).json({ 
+              error: `You already have an active order in progress (${orderNum}). Please wait until your current order is delivered before placing another order.`,
+              code: 'ACTIVE_ORDER_EXISTS',
+              activeOrderId: activeOrderDoc.id,
+              activeOrderStatus: activeData.status
+            });
+            return;
+          }
         }
+      } catch (firestoreErr: any) {
+        console.warn('[Orders] Firestore active order check notice (quota/network):', firestoreErr?.message);
       }
     } catch (activeOrderErr: any) {
       console.warn('[Orders] Active order check notice:', activeOrderErr.message);
     }
 
-    // 1. Fetch user data from Firestore
+    // 1. Fetch user data (PostgreSQL primary with bounded Firestore fallback)
     let userData: any = {};
     try {
-      const userDoc = await adminDb.collection('users').doc(userId).get();
-      if (userDoc.exists) userData = userDoc.data()!;
-    } catch (uErr) {
-      console.warn('[Orders] User doc read notice:', uErr);
+      const userEmail = ((req.user as any)?.email || '').trim();
+      const pgUserRes = await query(
+        `SELECT name, phone, email, default_address, metadata
+         FROM app_users
+         WHERE id = $1 OR firebase_uid = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2))
+         LIMIT 1`,
+        [userId, userEmail]
+      );
+      if (pgUserRes.rows.length > 0) {
+        const u = pgUserRes.rows[0];
+        const meta = u.metadata && typeof u.metadata === 'object' ? u.metadata : {};
+        const resolvedAddr = u.default_address || meta.full_address || meta.fullAddress || meta.address || null;
+        const resolvedLoc = meta.location && meta.location.lat != null && meta.location.lng != null
+          ? meta.location
+          : (meta.latitude != null && meta.longitude != null ? { lat: Number(meta.latitude), lng: Number(meta.longitude) } : null);
+        userData = {
+          name: u.name,
+          phone: u.phone,
+          email: u.email,
+          full_address: resolvedAddr,
+          fullAddress: resolvedAddr,
+          location: resolvedLoc
+        };
+      }
+    } catch (pgUErr: any) {
+      console.warn('[Orders] PostgreSQL user read notice:', pgUErr?.message);
+    }
+
+    if (!userData.name || !userData.phone) {
+      try {
+        const userDoc = await withFirestoreTimeout(
+          adminDb.collection('users').doc(userId).get(),
+          'userProfileFallback',
+          1500
+        );
+        if (userDoc.exists) {
+          userData = { ...userDoc.data()!, ...userData };
+        }
+      } catch (uErr: any) {
+        console.warn('[Orders] User doc read notice:', uErr?.message || uErr);
+      }
     }
     
     const incomingOrderSource = (req.body.orderSource || 'ONLINE').toUpperCase();
@@ -933,20 +1228,24 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
     let branchDeliverySettings: any = null;
     let restaurantDeliverySettings: any = null;
 
-    // Lookup resolved branch details to guarantee consistent name & IDs
+    // Lookup resolved branch details to guarantee consistent name & IDs (PostgreSQL first)
+    let branchFoundInPg = false;
     try {
-      const bDoc = await adminDb.collection('franchises').doc(resolvedBranchId).get();
-      if (bDoc.exists) {
-        const bData = bDoc.data()!;
+      const { query } = await import('../lib/db.js');
+      const bRes = await query(
+        `SELECT id, name, franchise_id, is_open, accepting_orders, close_reason FROM restaurant_branches WHERE id = $1 LIMIT 1`,
+        [resolvedBranchId]
+      );
+      if (bRes.rows.length > 0) {
+        branchFoundInPg = true;
+        const bData = bRes.rows[0];
         resolvedBranchName = bData.name || resolvedBranchName;
-        resolvedFranchiseId = bData.franchiseId || resolvedFranchiseId;
-        resolvedOrgId = bData.organizationId || resolvedOrgId;
-        branchDeliverySettings = bData.deliverySettings || null;
+        resolvedFranchiseId = bData.franchise_id || resolvedFranchiseId;
 
         // Check operational availability of branch
-        if (bData.isActive === false || bData.isOpen === false || bData.acceptingOrders === false) {
+        if (bData.is_open === false || bData.accepting_orders === false) {
           res.status(400).json({
-            error: `${resolvedBranchName} is currently closed and not accepting orders.`,
+            error: bData.close_reason || `${resolvedBranchName} is currently closed and not accepting orders.`,
             code: 'RESTAURANT_CLOSED',
             canAcceptOrders: false,
             isOpen: false
@@ -954,28 +1253,54 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
           return;
         }
       }
-    } catch (bErr) {
-      console.warn('[Orders] Branch document read notice:', bErr);
+    } catch (pgErr: any) {
+      console.warn('[Orders] PostgreSQL branch lookup notice:', pgErr.message);
     }
 
-    // Check restaurant_settings collection for the branch
-    try {
-      const restDoc = await adminDb.collection('restaurant_settings').doc(resolvedBranchId).get();
-      if (restDoc.exists) {
-        const restData = restDoc.data() || {};
-        restaurantDeliverySettings = restData.deliverySettings || restData;
-        if (restData.isOpen === false || restData.acceptingOrders === false) {
-          res.status(400).json({
-            error: restData.closeReason || `${resolvedBranchName} is currently closed and not accepting orders.`,
-            code: 'RESTAURANT_CLOSED',
-            canAcceptOrders: false,
-            isOpen: false
-          });
-          return;
+    if (!branchFoundInPg) {
+      try {
+        const bDoc = await adminDb.collection('franchises').doc(resolvedBranchId).get();
+        if (bDoc.exists) {
+          const bData = bDoc.data()!;
+          resolvedBranchName = bData.name || resolvedBranchName;
+          resolvedFranchiseId = bData.franchiseId || resolvedFranchiseId;
+          resolvedOrgId = bData.organizationId || resolvedOrgId;
+          branchDeliverySettings = bData.deliverySettings || null;
+
+          // Check operational availability of branch
+          if (bData.isActive === false || bData.isOpen === false || bData.acceptingOrders === false) {
+            res.status(400).json({
+              error: `${resolvedBranchName} is currently closed and not accepting orders.`,
+              code: 'RESTAURANT_CLOSED',
+              canAcceptOrders: false,
+              isOpen: false
+            });
+            return;
+          }
         }
+      } catch (bErr) {
+        console.warn('[Orders] Branch document read notice:', bErr);
       }
-    } catch (restErr) {
-      console.warn('[Orders] Restaurant status read notice:', restErr);
+
+      // Check restaurant_settings collection for the branch
+      try {
+        const restDoc = await adminDb.collection('restaurant_settings').doc(resolvedBranchId).get();
+        if (restDoc.exists) {
+          const restData = restDoc.data() || {};
+          restaurantDeliverySettings = restData.deliverySettings || restData;
+          if (restData.isOpen === false || restData.acceptingOrders === false) {
+            res.status(400).json({
+              error: restData.closeReason || `${resolvedBranchName} is currently closed and not accepting orders.`,
+              code: 'RESTAURANT_CLOSED',
+              canAcceptOrders: false,
+              isOpen: false
+            });
+            return;
+          }
+        }
+      } catch (restErr) {
+        console.warn('[Orders] Restaurant status read notice:', restErr);
+      }
     }
 
     // 0.5. Check Delivery Availability if delivery requested
@@ -1024,18 +1349,40 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
 
       let menuData: any = null;
       try {
-        // Fetch product/combo metadata for image & category
-        let docSnap = await adminDb.collection('products').doc(itemId).get();
-        if (docSnap.exists) {
-          menuData = docSnap.data();
-        } else {
-          docSnap = await adminDb.collection('combos').doc(itemId).get();
+        const { query } = await import('../lib/db.js');
+        const pRes = await query(
+          `SELECT id, name, category_id, image_url, is_active FROM menu_products WHERE id = $1 LIMIT 1`,
+          [itemId]
+        );
+        if (pRes.rows.length > 0) {
+          const p = pRes.rows[0];
+          menuData = {
+            name: p.name,
+            productName: p.name,
+            imageUrl: p.image_url,
+            isAvailable: p.is_active,
+            isActive: p.is_active,
+            price: authoritativePrice.unitPrice,
+            basePrice: authoritativePrice.basePrice
+          };
+        }
+      } catch (pgPErr: any) {}
+
+      if (!menuData) {
+        try {
+          // Fetch product/combo metadata for image & category
+          let docSnap = await adminDb.collection('products').doc(itemId).get();
           if (docSnap.exists) {
             menuData = docSnap.data();
+          } else {
+            docSnap = await adminDb.collection('combos').doc(itemId).get();
+            if (docSnap.exists) {
+              menuData = docSnap.data();
+            }
           }
+        } catch (dbReadErr) {
+          console.warn('[Orders] DB lookup fallback:', dbReadErr);
         }
-      } catch (dbReadErr) {
-        console.warn('[Orders] DB lookup fallback:', dbReadErr);
       }
 
       if (!menuData) {
@@ -1415,6 +1762,25 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
       const billNumber = permanentBillNo ? `#${permanentBillNo}` : `#BILL-${newOrderId.slice(0, 6).toUpperCase()}`;
       const billReference = 'bill_' + crypto.randomBytes(12).toString('hex');
 
+      // Compute dynamic initial preparation estimate from item categories, quantities, branch workload, and peak hour
+      let initialEstimatedPrepMinutes = 15;
+      let initialExpectedReadyAt: string | null = null;
+      try {
+        const { PreparationTimeEngine } = await import('../services/order/PreparationTimeEngine.js');
+        let pendingBranchCount = 0;
+        try {
+          const wlRes = await query(
+            `SELECT COUNT(*)::int AS cnt FROM canonical_orders WHERE branch_id = $1 AND order_status IN ('PENDING', 'ACCEPTED', 'PREPARING')`,
+            [resolvedBranchId]
+          );
+          pendingBranchCount = wlRes.rows[0]?.cnt || 0;
+        } catch {}
+        initialEstimatedPrepMinutes = PreparationTimeEngine.calculateEstimatedPreparationMinutes(validatedItems, pendingBranchCount);
+        initialExpectedReadyAt = PreparationTimeEngine.computeExpectedReadyAt(new Date(), initialEstimatedPrepMinutes);
+      } catch (prepErr: any) {
+        console.warn('[Orders] Initial dynamic prep time notice:', prepErr?.message);
+      }
+
       const orderFirestoreDoc = {
         id: newOrderId,
         orderId: newOrderId,
@@ -1476,6 +1842,10 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         paymentDetails: req.body.paymentDetails || null,
         fulfillmentType: deliveryType,
         deliveryType: deliveryType,
+        estimatedPreparationMinutes: initialEstimatedPrepMinutes,
+        prepTimeMinutes: initialEstimatedPrepMinutes,
+        expectedReadyAt: initialExpectedReadyAt,
+        estimatedReadyAt: initialExpectedReadyAt,
         notificationDispatched: true,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -1494,62 +1864,60 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         return;
       }
 
-      // STEP 4: Project order document to Firestore for live operational consumers
+      // STEP 4: Project order document to Firestore for live operational consumers (bounded so quota retries never stall checkout)
+      const projectionPromise = adminDb.collection('orders').doc(newOrderId).set(orderFirestoreDoc)
+        .then(async () => {
+          await query("UPDATE canonical_orders SET live_lifecycle = 'ACTIVE' WHERE id = $1 AND live_lifecycle = 'PROJECTION_PENDING'", [newOrderId]).catch(() => {});
+          FirestoreListener.markOrderProcessed(newOrderId);
+          adminDb.collection('user_carts').doc(userId).set({
+            userId,
+            items: [],
+            total: 0,
+            itemCount: 0,
+            lastOrderId: newOrderId,
+            lastOrderPlacedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            abandonedCartReminderSentAt: null
+          }, { merge: true }).catch(() => {});
+        });
+
       try {
-        await adminDb.collection('orders').doc(newOrderId).set(orderFirestoreDoc);
-
-        // Mark projection resolved in PostgreSQL canonical store
-        await query("UPDATE canonical_orders SET live_lifecycle = 'ACTIVE' WHERE id = $1 AND live_lifecycle = 'PROJECTION_PENDING'", [newOrderId]).catch(() => {});
-
-        // Mark order as already processed in FirestoreListener to prevent duplicate new-order alert
-        FirestoreListener.markOrderProcessed(newOrderId);
-
+        await withFirestoreTimeout(projectionPromise, 'orderProjection', 1500);
         trace.steps.push({ step: 'Firestore Projection', status: 'success', orderId: newOrderId, dailyOrderNumber, permanentBillNo, billReference });
-
-        // Reset user's active cart upon successful order placement (prevents abandoned cart reminder)
-        adminDb.collection('user_carts').doc(userId).set({
-          userId,
-          items: [],
-          total: 0,
-          itemCount: 0,
-          lastOrderId: newOrderId,
-          lastOrderPlacedAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          abandonedCartReminderSentAt: null
-        }, { merge: true }).catch(() => {});
-
-        // Asynchronously sync online order to franchise-specific Google Spreadsheet
-        FranchiseGoogleSheetsService.syncOrderToFranchise({
-          id: newOrderId,
-          userId,
-          items: validatedItems,
-          totalAmount: finalOrderTotal,
-          subtotal: serverCalculatedTotal,
-          deliveryFee,
-          taxes,
-          discountAmount,
-          status: 'pending',
-          contactPhone: userPhone,
-          customerName: userData.name || (req.user as any)?.name || 'Gourmet Customer',
-          dailyOrderNumber,
-          orderSource: resolvedOrderSource,
-          paymentMethod: req.body.paymentMethod || 'COD',
-          paymentStatus: (req.body.paymentMethod || 'COD').toUpperCase() === 'ONLINE' ? 'PAID' : 'PENDING',
-          branchId: resolvedBranchId,
-          branchName: resolvedBranchName,
-          franchiseId: resolvedFranchiseId,
-          deliveryAddress: { addressLine: userAddress || 'Pickup' },
-          createdAt: new Date()
-        }).catch(e => console.warn('[OnlineOrderSheetSync] Notice:', e.message));
       } catch (err: any) {
         console.warn(`[Orders] Firestore operational projection degraded for order ${newOrderId}:`, err.message);
         trace.steps.push({ step: 'Firestore Projection', status: 'degraded', error: err.message });
         // Order is committed in PostgreSQL; flag projection for background reconciliation
+        projectionPromise.catch(() => {});
         await query(
           `UPDATE canonical_orders SET live_lifecycle = 'PROJECTION_PENDING' WHERE id = $1`,
           [newOrderId]
         ).catch(() => {});
       }
+
+      // Asynchronously sync online order to franchise-specific Google Spreadsheet regardless of Firestore status
+      FranchiseGoogleSheetsService.syncOrderToFranchise({
+        id: newOrderId,
+        userId,
+        items: validatedItems,
+        totalAmount: finalOrderTotal,
+        subtotal: serverCalculatedTotal,
+        deliveryFee,
+        taxes,
+        discountAmount,
+        status: 'pending',
+        contactPhone: userPhone,
+        customerName: userData.name || (req.user as any)?.name || 'Gourmet Customer',
+        dailyOrderNumber,
+        orderSource: resolvedOrderSource,
+        paymentMethod: req.body.paymentMethod || 'COD',
+        paymentStatus: (req.body.paymentMethod || 'COD').toUpperCase() === 'ONLINE' ? 'PAID' : 'PENDING',
+        branchId: resolvedBranchId,
+        branchName: resolvedBranchName,
+        franchiseId: resolvedFranchiseId,
+        deliveryAddress: { addressLine: userAddress || 'Pickup' },
+        createdAt: new Date()
+      }).catch(e => console.warn('[OnlineOrderSheetSync] Notice:', e.message));
 
     trace.processingTime = Date.now() - startTime;
     res.status(201).json({ 
@@ -1565,6 +1933,8 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
       couponRejectReason: couponRejectReason || null,
       discountAmount,
       finalTotal: finalOrderTotal,
+      estimatedPreparationMinutes: initialEstimatedPrepMinutes,
+      expectedReadyAt: initialExpectedReadyAt,
       trace: isDebug ? trace : undefined 
     });
 
@@ -1697,8 +2067,16 @@ router.all(['/:id/status'], verifyToken, async (req: AuthRequest, res: Response)
     const emailLower = (req.user?.email || '').toLowerCase();
     const name = (req.user as any)?.name || (req.user as any)?.displayName || req.user?.email || 'Staff';
     const appTarget = ((req.headers['x-app-target'] || req.headers['x-app-source'] || '') as string).toUpperCase();
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = role === 'owner' || role === 'platform_owner' || req.user?.isGlobalOwner === true;
     const isDeliveryApp = appTarget === 'DELIVERY';
+
+    // Owner Portal Read-Only Enforcement (Rule A1)
+    if (appTarget === 'OWNER' && isMasterAccount) {
+      res.status(403).json({
+        error: 'Forbidden: Owner portal has read-only operational authority. Operational transitions must be executed by restaurant staff or riders.'
+      });
+      return;
+    }
 
     let effectiveRole = role;
     if (role === 'owner' || role === 'admin' || isMasterAccount) {
@@ -1724,30 +2102,30 @@ router.all(['/:id/status'], verifyToken, async (req: AuthRequest, res: Response)
       return;
     }
 
-    // Pre-check order existence and branch scoping
+    // Pre-check order existence and branch scoping (PostgreSQL authoritative first)
     let orderBranchId = '';
     let orderExists = false;
 
     try {
-      const orderDoc = await adminDb.collection('orders').doc(id).get();
-      if (orderDoc.exists) {
+      const { query: pgQuery } = await import('../config/postgres.js');
+      const pgRes = await pgQuery('SELECT branch_id FROM canonical_orders WHERE id = $1 LIMIT 1', [id]);
+      if (pgRes.rows.length > 0) {
         orderExists = true;
-        orderBranchId = orderDoc.data()?.branchId || '';
+        orderBranchId = pgRes.rows[0].branch_id || '';
       }
-    } catch (fsErr: any) {
-      console.warn('[Orders] Firestore read notice for /:id/status pre-check:', fsErr.message);
+    } catch (pgErr: any) {
+      console.warn('[Orders] PG read notice for /:id/status pre-check:', pgErr.message);
     }
 
     if (!orderExists) {
       try {
-        const { query: pgQuery } = await import('../config/postgres.js');
-        const pgRes = await pgQuery('SELECT branch_id FROM canonical_orders WHERE id = $1', [id]);
-        if (pgRes.rows.length > 0) {
+        const orderDoc = await withFirestoreTimeout(adminDb.collection('orders').doc(id).get(), 'statusPreCheckRead', 1500);
+        if (orderDoc.exists) {
           orderExists = true;
-          orderBranchId = pgRes.rows[0].branch_id || '';
+          orderBranchId = orderDoc.data()?.branchId || '';
         }
-      } catch (pgErr: any) {
-        console.warn('[Orders] PostgreSQL fallback order check notice:', pgErr.message);
+      } catch (fsErr: any) {
+        console.warn('[Orders] Firestore read notice for /:id/status pre-check:', fsErr.message);
       }
     }
 
@@ -1773,6 +2151,10 @@ router.all(['/:id/status'], verifyToken, async (req: AuthRequest, res: Response)
     if (deliveryPartnerPhone) metadata.deliveryPartnerPhone = deliveryPartnerPhone;
     const targetPrep = Number(estimatedPreparationMinutes ?? prepMinutes);
     if (!isNaN(targetPrep) && targetPrep > 0) metadata.estimatedPreparationMinutes = targetPrep;
+    if (req.body.clientCoordinates) metadata.clientCoordinates = req.body.clientCoordinates;
+    else if (req.body.coordinates) metadata.clientCoordinates = req.body.coordinates;
+    else if (req.body.location) metadata.clientCoordinates = req.body.location;
+    if (req.body.paymentCollected !== undefined) metadata.paymentCollected = req.body.paymentCollected;
 
     const result = await OrderStateMachine.transition(id, status as any, { uid, role: effectiveRole, name, branchId: userBranchId || orderBranchId }, metadata);
     if (!result.success) {
@@ -1808,7 +2190,7 @@ router.post('/:id/accept', verifyToken, async (req: AuthRequest, res: Response) 
       });
     }
 
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = userRole === 'owner' || userRole === 'platform_owner' || req.user?.isGlobalOwner === true;
     let effectiveRole = userRole;
     if (userRole === 'owner' || userRole === 'admin' || isMasterAccount) {
       effectiveRole = 'restaurant_manager';
@@ -1821,28 +2203,28 @@ router.post('/:id/accept', verifyToken, async (req: AuthRequest, res: Response) 
       return res.status(403).json({ success: false, error: 'Unauthorized: Restaurant staff authorization required', requestId });
     }
 
-    // Pre-check order existence and branch scoping (Firestore & PostgreSQL authoritative fallback)
+    // Pre-check order existence and branch scoping (PostgreSQL authoritative first with Firestore fallback)
     let orderData: any = null;
     let orderBranchId = '';
     try {
-      const orderDoc = await adminDb.collection('orders').doc(id).get();
-      if (orderDoc.exists) {
-        orderData = orderDoc.data()!;
-        orderBranchId = orderData.branchId || '';
+      const { OrderPersistenceArchiveService } = await import('../services/order/OrderPersistenceArchiveService.js');
+      orderData = await OrderPersistenceArchiveService.getHistoricalOrder(id);
+      if (orderData) {
+        orderBranchId = orderData.branchId || orderData.branch_id || '';
       }
-    } catch (fsErr: any) {
-      console.warn(`[Orders] Firestore read notice for /:id/accept:`, fsErr.message);
+    } catch (pgErr: any) {
+      console.warn(`[Orders] PostgreSQL read notice for /:id/accept:`, pgErr.message);
     }
 
     if (!orderData) {
       try {
-        const { OrderPersistenceArchiveService } = await import('../services/order/OrderPersistenceArchiveService.js');
-        orderData = await OrderPersistenceArchiveService.getHistoricalOrder(id);
-        if (orderData) {
+        const orderDoc = await withFirestoreTimeout(adminDb.collection('orders').doc(id).get(), 'acceptOrderRead', 1500);
+        if (orderDoc.exists) {
+          orderData = orderDoc.data()!;
           orderBranchId = orderData.branchId || '';
         }
-      } catch (pgErr: any) {
-        console.warn(`[Orders] PostgreSQL fallback notice for /:id/accept:`, pgErr.message);
+      } catch (fsErr: any) {
+        console.warn(`[Orders] Firestore read notice for /:id/accept:`, fsErr.message);
       }
     }
 
@@ -1881,8 +2263,45 @@ router.post('/:id/accept', verifyToken, async (req: AuthRequest, res: Response) 
       });
     }
 
-    const targetPrepMinutes = Number(req.body?.estimatedPreparationMinutes ?? req.body?.prepMinutes) || undefined;
-    const transitionMetadata = targetPrepMinutes ? { estimatedPreparationMinutes: targetPrepMinutes } : {};
+    let targetPrepMinutes = Number(req.body?.estimatedPreparationMinutes ?? req.body?.prepMinutes) || undefined;
+    if (!targetPrepMinutes) {
+      // Auto-assign prep time dynamically using PreparationTimeEngine based on order items and branch
+      try {
+        const { PreparationTimeEngine } = await import('../services/order/PreparationTimeEngine.js');
+        const estimate = await PreparationTimeEngine.calculateIntelligentEstimate({
+          items: orderData.items || [],
+          branchId: orderBranchId
+        });
+        targetPrepMinutes = estimate.estimatedMinutes;
+      } catch (err: any) {
+        const { PreparationTimeEngine } = await import('../services/order/PreparationTimeEngine.js');
+        targetPrepMinutes = PreparationTimeEngine.calculateEstimatedPreparationMinutes(orderData.items || []);
+      }
+    }
+
+    const { PreparationTimeEngine } = await import('../services/order/PreparationTimeEngine.js');
+    const expectedReadyAt = PreparationTimeEngine.computeExpectedReadyAt(new Date(), targetPrepMinutes || 15);
+    const transitionMetadata = {
+      estimatedPreparationMinutes: targetPrepMinutes,
+      expectedReadyAt,
+      estimatedReadyAt: expectedReadyAt
+    };
+
+    // Update canonical_orders with authoritative prep time metrics
+    try {
+      const { query } = await import('../config/postgres.js');
+      await query(`
+        UPDATE canonical_orders
+        SET estimated_preparation_minutes = $1,
+            expected_ready_at = $2,
+            preparation_started_at = COALESCE(preparation_started_at, NOW()),
+            accepted_at = COALESCE(accepted_at, NOW()),
+            updated_at = NOW()
+        WHERE id = $3
+      `, [targetPrepMinutes, expectedReadyAt, id]);
+    } catch (pgErr: any) {
+      console.warn('[Orders] PostgreSQL accept prep time update notice:', pgErr.message);
+    }
 
     // Step 1: If pending, transition to accepted
     if (currentStatus === 'pending' || currentStatus === 'pending_acceptance') {
@@ -1918,6 +2337,8 @@ router.post('/:id/accept', verifyToken, async (req: AuthRequest, res: Response) 
       message: `Order #${orderData.orderNumber || id} accepted and baking started`,
       orderId: id,
       status: 'preparing',
+      estimatedPreparationMinutes: targetPrepMinutes,
+      expectedReadyAt,
       version: prepResult.version,
       requestId
     });
@@ -1946,7 +2367,7 @@ router.post('/:id/confirm-prep-time', verifyToken, async (req: AuthRequest, res:
       });
     }
 
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = userRole === 'owner' || userRole === 'platform_owner' || req.user?.isGlobalOwner === true;
     let effectiveRole = userRole;
     if (userRole === 'owner' || userRole === 'admin' || isMasterAccount) {
       effectiveRole = 'restaurant_manager';
@@ -2081,7 +2502,7 @@ router.post('/:id/reject', verifyToken, async (req: AuthRequest, res: Response) 
       });
     }
 
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = userRole === 'owner' || userRole === 'platform_owner' || req.user?.isGlobalOwner === true;
     let effectiveRole = userRole;
     if (userRole === 'owner' || userRole === 'admin' || isMasterAccount) {
       effectiveRole = 'restaurant_manager';
@@ -2191,7 +2612,7 @@ router.post('/:id/acknowledge', verifyToken, async (req: AuthRequest, res: Respo
     const uid = req.user?.uid;
     const userBranchId = req.user?.branchId;
     const name = (req.user as any)?.name || req.user?.email || 'Staff';
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = userRole === 'owner' || userRole === 'platform_owner' || req.user?.isGlobalOwner === true;
 
     let effectiveRole = userRole;
     if (userRole === 'owner' || userRole === 'admin' || isMasterAccount) {
@@ -2283,7 +2704,7 @@ router.post('/:id/assign-rider', verifyToken, async (req: AuthRequest, res: Resp
     const name = (req.user as any)?.name || req.user?.email || 'Manager';
     
     const emailLower = (req.user?.email || '').toLowerCase();
-    const isMasterAccount = emailLower === 'olivepizzarjn@gmail.com' || emailLower === 'webhub2811@gmail.com';
+    const isMasterAccount = userRole === 'owner' || userRole === 'platform_owner' || req.user?.isGlobalOwner === true;
     const isAuthorized = ['owner', 'admin', 'manager', 'restaurant_manager'].includes(userRole) || isMasterAccount;
 
     if (!isAuthorized || !uid) {

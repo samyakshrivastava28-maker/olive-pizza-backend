@@ -37,7 +37,7 @@ router.get(['/health', '/health/liveness', '/live', '/api/live'], (_req, res) =>
 });
 
 // Version info
-router.get('/version', (req, res) => {
+router.get(['/version', '/health/version'], (req, res) => {
   res.json({
     status: 'ok',
     api_version: 'v2.1.0'
@@ -51,7 +51,7 @@ let cachedFirestoreProbe: { status: 'healthy' | 'unhealthy'; error?: string; exp
  * Readiness Probe:
  * Returns simple pass/fail status without exposing internal infrastructure topology or connection metrics.
  */
-router.get(['/ready', '/health/readiness', '/api/ready'], async (req, res) => {
+router.get(['/ready', '/health/ready', '/health/readiness', '/api/ready'], async (req, res) => {
   let firestoreStatus = 'healthy';
   let postgresStatus = 'healthy';
   let redisStatus = 'healthy';

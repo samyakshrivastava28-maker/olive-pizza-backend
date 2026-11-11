@@ -230,6 +230,15 @@ const server = app.listen(Number(PORT), '0.0.0.0', () => {
     FirestoreListener.init();
     OrderFulfillmentWorker.start();
 
+    // Start Transactional Outbox Publisher Worker
+    try {
+      const { OutboxPublisherService } = await import('./src/services/outbox/OutboxPublisherService.ts');
+      OutboxPublisherService.startWorker(5000);
+      console.log('[OutboxWorker] Outbox publisher worker started (5s poll)');
+    } catch (err: any) {
+      console.warn('[OutboxWorker] Startup warning:', err?.message);
+    }
+
     // Archival safeguard & reconciliation worker (runs every 3 minutes)
     setInterval(() => {
       import('./src/services/order/OrderPersistenceArchiveService.js')

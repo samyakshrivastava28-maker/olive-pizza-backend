@@ -66,6 +66,77 @@ function uploadBufferToCloudinary(
   });
 }
 
+router.get(['/list', '/assets'], async (req: Request, res: Response) => {
+  try {
+    const folder = (req.query.folder as string) || 'olive-pizza';
+    const tag = req.query.tag as string | undefined;
+    const search = req.query.q as string | undefined;
+    const maxResults = parseInt((req.query.max as string) || '100', 10);
+
+    let expression = `folder:${folder}*`;
+    if (tag) expression += ` AND tags=${tag}`;
+    if (search) expression += ` AND ${search}`;
+
+    let assets: any[] = [];
+    try {
+      const result = await cloudinary.search
+        .expression(expression)
+        .sort_by('created_at', 'desc')
+        .max_results(maxResults)
+        .with_field('tags')
+        .with_field('context')
+        .execute();
+
+      assets = (result.resources || []).map((r: any) => ({
+        id: r.public_id,
+        publicId: r.public_id,
+        name: r.filename || r.public_id.split('/').pop(),
+        url: r.secure_url,
+        mediaUrl: r.secure_url,
+        thumbnailUrl: r.secure_url.replace('/upload/', '/upload/c_thumb,w_300,h_300/'),
+        folder: r.folder,
+        format: r.format,
+        bytes: r.bytes,
+        uploadedAt: r.created_at,
+      }));
+    } catch (cErr: any) {
+      console.warn('[MediaRoutes] Cloudinary search notice:', cErr.message);
+    }
+
+    // High quality brand fallback images if empty
+    if (assets.length === 0) {
+      assets = [
+        {
+          id: 'olive-pizza/brand/logo',
+          publicId: 'olive-pizza/brand/logo',
+          name: 'Olive Pizza Logo',
+          url: 'https://res.cloudinary.com/dxmlvkff1/image/upload/v1782376898/olive-pizza/brand/logo.png',
+          mediaUrl: 'https://res.cloudinary.com/dxmlvkff1/image/upload/v1782376898/olive-pizza/brand/logo.png',
+          thumbnailUrl: 'https://res.cloudinary.com/dxmlvkff1/image/upload/c_thumb,w_300,h_300/v1782376898/olive-pizza/brand/logo.png',
+          folder: 'olive-pizza/brand',
+          format: 'png',
+          uploadedAt: new Date().toISOString(),
+        },
+        {
+          id: 'olive-pizza/hero-bg',
+          publicId: 'olive-pizza/hero-bg',
+          name: 'Hero Pizza Background',
+          url: 'https://res.cloudinary.com/dxmlvkff1/image/upload/f_auto,q_auto:best,w_1920/v1783008946/olive-pizza-hero-background_d9rbzc.webp',
+          mediaUrl: 'https://res.cloudinary.com/dxmlvkff1/image/upload/f_auto,q_auto:best,w_1920/v1783008946/olive-pizza-hero-background_d9rbzc.webp',
+          thumbnailUrl: 'https://res.cloudinary.com/dxmlvkff1/image/upload/c_thumb,w_300,h_300/v1783008946/olive-pizza-hero-background_d9rbzc.webp',
+          folder: 'olive-pizza/banners',
+          format: 'webp',
+          uploadedAt: new Date().toISOString(),
+        }
+      ];
+    }
+
+    res.json({ success: true, count: assets.length, media: assets, assets });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 router.get('/test', async (req: Request, res: Response) => {
   try {
     const config = cloudinary.config();

@@ -95,9 +95,20 @@ export class CODCollectionService {
     const assignedRider = order.deliveryPartnerId || order.riderId;
     const isSuperRole = ['admin', 'owner', 'developer', 'system'].includes(actorRole);
     if (assignedRider && actorUid !== assignedRider && !isSuperRole) {
-      throw new Error(
-        `Delivery partner '${actorUid}' is not assigned to order '${orderId}' (assigned to: '${assignedRider}').`
-      );
+      let isAssignedPartner = false;
+      try {
+        const { query } = await import('../../lib/db.js');
+        const dpRes = await query(
+          'SELECT id, user_id FROM delivery_partners WHERE (id = $1 OR user_id = $1) AND (user_id = $2 OR id = $2) LIMIT 1',
+          [assignedRider, actorUid]
+        );
+        if (dpRes.rows.length > 0) isAssignedPartner = true;
+      } catch (e) {}
+      if (!isAssignedPartner) {
+        throw new Error(
+          `Delivery partner '${actorUid}' is not assigned to order '${orderId}' (assigned to: '${assignedRider}').`
+        );
+      }
     }
 
     // 5. Tenant Branch Isolation Check

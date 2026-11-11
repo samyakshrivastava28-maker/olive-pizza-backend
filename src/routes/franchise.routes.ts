@@ -1,4 +1,6 @@
 import { Router, Request, Response } from 'express';
+import { withTimeout, getIstDateKey } from '../lib/utils.js';
+import { pgPool } from '../config/postgres.js';
 import crypto from 'crypto';
 import { adminDb, adminAuth } from '../config/firebase.js';
 import { query } from '../config/postgres.js';
@@ -19,11 +21,20 @@ async function generateUniquePosActivationCode(reservedCodes: Set<string> = new 
   for (let attempt = 0; attempt < 25; attempt += 1) {
     const candidate = String(crypto.randomInt(100000, 1000000));
     if (reservedCodes.has(candidate)) continue;
-    const duplicate = await adminDb.collection('pos_terminals')
-      .where('activationCode', '==', candidate)
-      .limit(1)
-      .get();
-    if (duplicate.empty) {
+    try {
+      const duplicate = await withTimeout(
+        adminDb.collection('pos_terminals')
+          .where('activationCode', '==', candidate)
+          .limit(1)
+          .get(),
+        'posActivationCodeLookup',
+        1200
+      );
+      if (!duplicate || duplicate.empty) {
+        reservedCodes.add(candidate);
+        return candidate;
+      }
+    } catch {
       reservedCodes.add(candidate);
       return candidate;
     }
@@ -163,13 +174,73 @@ router.get('/', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'f
   try {
     const scope = req.user?.scope || FranchiseScopeService.resolveScope(req.user);
 
-    // Fetch franchise entities from Firestore
-    const entitySnap = await adminDb.collection('franchise_entities').get();
-    let franchiseEntities: any[] = entitySnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    // 1. Authoritative PostgreSQL read FIRST (quota-proof)
+    const [pgFrRes, pgBrRes] = await Promise.all([
+      pgPool.query(`SELECT id, name, status, owner_email, created_at, updated_at FROM franchises ORDER BY created_at ASC`).catch(() => ({ rows: [] as any[] })),
+      pgPool.query(
+        `SELECT id, franchise_id, name, address, phone, is_open, accepting_orders, current_prep_time,
+                operating_hours, delivery_settings, metadata, created_at, updated_at, latitude, longitude
+         FROM restaurant_branches ORDER BY created_at ASC`
+      ).catch(() => ({ rows: [] as any[] }))
+    ]);
 
-    // Fetch branches from Firestore
-    const branchSnap = await adminDb.collection('franchises').get();
-    let branches: any[] = branchSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    const entityMap = new Map<string, any>();
+    for (const row of pgFrRes.rows) {
+      const slug = row.id.replace(/^fra_/, '');
+      entityMap.set(row.id, {
+        id: row.id,
+        slug,
+        name: row.name,
+        status: row.status || 'ACTIVE',
+        isActive: (row.status || 'ACTIVE') === 'ACTIVE',
+        franchiseOwnerEmail: row.owner_email || null,
+        contactEmail: row.owner_email || null,
+        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+        updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+      });
+    }
+
+    const branchMap = new Map<string, any>();
+    for (const b of pgBrRes.rows) {
+      const meta = (b.metadata && typeof b.metadata === 'object') ? b.metadata : {};
+      branchMap.set(b.id, {
+        id: b.id,
+        franchiseId: b.franchise_id,
+        name: b.name,
+        address: b.address,
+        phone: b.phone,
+        isOpen: b.is_open !== false,
+        acceptingOrders: b.accepting_orders !== false,
+        currentPrepTime: b.current_prep_time || 20,
+        operatingHours: b.operating_hours,
+        deliverySettings: b.delivery_settings,
+        latitude: b.latitude,
+        longitude: b.longitude,
+        status: meta.status || (b.is_open === false ? 'INACTIVE' : 'ACTIVE'),
+        isActive: meta.status !== 'deleted',
+        createdAt: b.created_at instanceof Date ? b.created_at.toISOString() : b.created_at,
+        updatedAt: b.updated_at instanceof Date ? b.updated_at.toISOString() : b.updated_at,
+        ...meta
+      });
+    }
+
+    // 2. Bounded Firestore metadata enrichment
+    const [entitySnap, branchSnap] = await Promise.all([
+      withTimeout(adminDb.collection('franchise_entities').get(), 'franchise.rootEntities', 1200).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('franchises').get(), 'franchise.rootBranches', 1200).catch(() => ({ docs: [] } as any))
+    ]);
+
+    for (const d of entitySnap.docs || []) {
+      const fsData = { id: d.id, ...(d.data() as any) };
+      entityMap.set(d.id, entityMap.has(d.id) ? { ...fsData, ...entityMap.get(d.id) } : fsData);
+    }
+    for (const d of branchSnap.docs || []) {
+      const fsData = { id: d.id, ...(d.data() as any) };
+      branchMap.set(d.id, branchMap.has(d.id) ? { ...fsData, ...branchMap.get(d.id) } : fsData);
+    }
+
+    let franchiseEntities: any[] = Array.from(entityMap.values());
+    let branches: any[] = Array.from(branchMap.values());
 
     // If non-global owner, scope records
     if (!scope.isGlobalOwner) {
@@ -718,26 +789,67 @@ router.patch('/:id/status', requireRole(['owner', 'admin', 'developer', 'platfor
 router.get('/list', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const scope = req.user?.scope || FranchiseScopeService.resolveScope(req.user);
-    const snap = await adminDb.collection('franchise_entities').get();
-    let franchises: FranchiseEntity[] = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as FranchiseEntity));
 
-    // Filter if restricted franchise owner
+    const [pgFrRes, pgBrRes, pgMgrRes, pgRiderRes, snap, bSnap, posSnap, mgrSnap, riderSnap] = await Promise.all([
+      pgPool.query(`SELECT id, name, status, owner_email, created_at, updated_at FROM franchises ORDER BY created_at ASC`).catch(() => ({ rows: [] as any[] })),
+      pgPool.query(`SELECT id, franchise_id, name, address, phone, is_open, accepting_orders, created_at FROM restaurant_branches ORDER BY created_at ASC`).catch(() => ({ rows: [] as any[] })),
+      pgPool.query(`SELECT id, franchise_id, branch_id FROM app_users WHERE is_active = true AND (allowed_apps ? 'RESTAURANT_MANAGER' OR role IN ('restaurant_manager', 'manager'))`).catch(() => ({ rows: [] as any[] })),
+      pgPool.query(`SELECT id, franchise_id, branch_id FROM delivery_partners WHERE status = 'APPROVED'`).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('franchise_entities').get(), 'franchise.listEntities', 1200).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('franchises').get(), 'franchise.listBranches', 1200).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('pos_terminals').get(), 'franchise.listTerminals', 1000).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('restaurant_managers').get(), 'franchise.listMgrs', 1000).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('delivery_partners').get(), 'franchise.listRiders', 1000).catch(() => ({ docs: [] } as any)),
+    ]);
+
+    const frMap = new Map<string, any>();
+    for (const row of pgFrRes.rows) {
+      frMap.set(row.id, {
+        id: row.id,
+        slug: row.id.replace(/^fra_/, ''),
+        organizationId: FranchiseScopeService.DEFAULT_ORG_ID,
+        name: row.name,
+        code: `OP-${row.id.replace(/^fra_/, '').slice(0, 3).toUpperCase()}-01`,
+        region: 'Chhattisgarh',
+        city: row.id.replace(/^fra_/, ''),
+        contactEmail: row.owner_email || '',
+        contactPhone: '+91 91799 44445',
+        mainBranchId: row.id === 'fra_rajnandgaon' ? 'main_branch' : `${row.id}_main`,
+        isActive: (row.status || 'ACTIVE') === 'ACTIVE',
+        status: (row.status || 'ACTIVE') as any,
+        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+        updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+      });
+    }
+    for (const d of snap.docs || []) {
+      const fsData = { id: d.id, ...(d.data() as any) };
+      frMap.set(d.id, frMap.has(d.id) ? { ...fsData, ...frMap.get(d.id) } : fsData);
+    }
+
+    let franchises: FranchiseEntity[] = Array.from(frMap.values()) as FranchiseEntity[];
     if (!scope.isGlobalOwner) {
       franchises = franchises.filter(f => f.id === scope.franchiseId || f.slug === scope.franchiseId);
     }
 
-    // Augment with live branch and terminal counts
-    const bSnap = await adminDb.collection('franchises').get().catch(() => ({ docs: [] } as any));
-    const allBranches: any[] = bSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    const brMap = new Map<string, any>();
+    for (const b of pgBrRes.rows) {
+      brMap.set(b.id, { id: b.id, franchiseId: b.franchise_id, name: b.name, address: b.address, phone: b.phone });
+    }
+    for (const d of bSnap.docs || []) {
+      if (!brMap.has(d.id)) brMap.set(d.id, { id: d.id, ...(d.data() as any) });
+    }
+    const allBranches: any[] = Array.from(brMap.values());
+    const allTerminals: any[] = (posSnap.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }));
 
-    const posSnap = await adminDb.collection('pos_terminals').get().catch(() => ({ docs: [] } as any));
-    const allTerminals: any[] = posSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    const mgrMap = new Map<string, any>();
+    for (const m of pgMgrRes.rows) mgrMap.set(m.id, { id: m.id, franchiseId: m.franchise_id, branchId: m.branch_id });
+    for (const d of mgrSnap.docs || []) if (!mgrMap.has(d.id)) mgrMap.set(d.id, { id: d.id, ...(d.data() as any) });
+    const allMgrs: any[] = Array.from(mgrMap.values());
 
-    const mgrSnap = await adminDb.collection('restaurant_managers').get().catch(() => ({ docs: [] } as any));
-    const allMgrs: any[] = mgrSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
-
-    const riderSnap = await adminDb.collection('delivery_partners').get().catch(() => ({ docs: [] } as any));
-    const allRiders: any[] = riderSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    const riderMap = new Map<string, any>();
+    for (const r of pgRiderRes.rows) riderMap.set(r.id, { id: r.id, franchiseId: r.franchise_id, branchId: r.branch_id });
+    for (const d of riderSnap.docs || []) if (!riderMap.has(d.id)) riderMap.set(d.id, { id: d.id, ...(d.data() as any) });
+    const allRiders: any[] = Array.from(riderMap.values());
 
     const augmented = franchises.map(f => {
       const branches = allBranches.filter(b => b.franchiseId === f.id || (f.id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary')));
@@ -771,24 +883,58 @@ router.get('/by-slug/:slug', requireRole(['owner', 'admin', 'developer', 'platfo
     const cleanSlug = slug.toLowerCase().trim();
     const scope = req.user?.scope || FranchiseScopeService.resolveScope(req.user);
 
-    const snap = await adminDb.collection('franchise_entities').get();
-    let franchise = snap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) } as FranchiseEntity))
-      .find(f => f.slug === cleanSlug || f.id === cleanSlug || f.id === `fra_${cleanSlug}` || (cleanSlug === 'rajnandgaon' && f.id === 'fra_rajnandgaon'));
+    const [pgFrRes, snap] = await Promise.all([
+      pgPool.query(`SELECT id, name, status, owner_email, created_at, updated_at FROM franchises`).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('franchise_entities').get(), 'franchise.bySlugEntities', 1200).catch(() => ({ docs: [] } as any))
+    ]);
 
-    // Auto-heal if not in franchise_entities but exists in franchises
-    if (!franchise) {
-      const bSnap = await adminDb.collection('franchises').get();
-      const matchingBranch = bSnap.docs
-        .map(d => ({ id: d.id, ...(d.data() as any) }))
-        .find(b => {
-          const bSlug = (b.slug || b.city || b.id.replace('fra_', '').replace('_branch', '')).toLowerCase();
-          return bSlug === cleanSlug || b.id === cleanSlug || b.id === `${cleanSlug}_branch`;
+    const entityList: FranchiseEntity[] = [];
+    const seenFrIds = new Set<string>();
+    for (const d of snap.docs || []) {
+      seenFrIds.add(d.id);
+      entityList.push({ id: d.id, ...(d.data() as any) } as FranchiseEntity);
+    }
+    for (const r of pgFrRes.rows) {
+      if (!seenFrIds.has(r.id)) {
+        entityList.push({
+          id: r.id,
+          slug: r.id.replace(/^fra_/, ''),
+          organizationId: FranchiseScopeService.DEFAULT_ORG_ID,
+          name: r.name,
+          code: `OP-${r.id.replace(/^fra_/, '').slice(0, 3).toUpperCase()}-01`,
+          region: 'Chhattisgarh',
+          city: r.id.replace(/^fra_/, ''),
+          contactEmail: r.owner_email || '',
+          contactPhone: '+91 91799 44445',
+          mainBranchId: r.id === 'fra_rajnandgaon' ? 'main_branch' : `${r.id}_main`,
+          isActive: (r.status || 'ACTIVE') === 'ACTIVE',
+          status: (r.status || 'ACTIVE') as any,
+          createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
+          updatedAt: r.updated_at instanceof Date ? r.updated_at.toISOString() : r.updated_at
         });
+      }
+    }
+
+    let franchise = entityList.find(f => f.slug === cleanSlug || f.id === cleanSlug || f.id === `fra_${cleanSlug}` || (cleanSlug === 'rajnandgaon' && f.id === 'fra_rajnandgaon'));
+
+    // Auto-heal from PG restaurant_branches or Firestore if not in franchise_entities
+    if (!franchise) {
+      const pgBr = await pgPool.query(
+        `SELECT id, franchise_id, name, address, phone, created_at FROM restaurant_branches`
+      ).catch(() => ({ rows: [] as any[] }));
+      const bSnap = await withTimeout(adminDb.collection('franchises').get(), 'franchise.bySlugBranches', 1200).catch(() => ({ docs: [] } as any));
+      const candidates = [
+        ...pgBr.rows.map((r: any) => ({ id: r.id, franchiseId: r.franchise_id, name: r.name, address: r.address, phone: r.phone, createdAt: r.created_at })),
+        ...(bSnap.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      ];
+      const matchingBranch = candidates.find((b: any) => {
+        const bSlug = String(b.slug || b.city || b.id.replace('fra_', '').replace('_branch', '')).toLowerCase();
+        return bSlug === cleanSlug || b.id === cleanSlug || b.id === `${cleanSlug}_branch` || b.franchiseId === `fra_${cleanSlug}`;
+      });
 
       if (matchingBranch) {
         const cityName = matchingBranch.city || cleanSlug;
-        const fId = `fra_${cleanSlug.replace(/[^a-z0-9]/g, '_')}`;
+        const fId = matchingBranch.franchiseId || `fra_${cleanSlug.replace(/[^a-z0-9]/g, '_')}`;
         const newEntity: FranchiseEntity = {
           id: fId,
           slug: cleanSlug,
@@ -797,7 +943,7 @@ router.get('/by-slug/:slug', requireRole(['owner', 'admin', 'developer', 'platfo
           code: matchingBranch.code || `OP-${cleanSlug.slice(0, 3).toUpperCase()}-01`,
           region: matchingBranch.state || 'Chhattisgarh',
           city: cityName,
-          contactEmail: matchingBranch.email || `franchise.${cleanSlug}@olivepizza.in`,
+          contactEmail: matchingBranch.email || 'olivepizzarjn@gmail.com',
           contactPhone: matchingBranch.phone || '+91 91799 44445',
           franchiseOwnerName: matchingBranch.franchiseOwnerName || 'Franchise Partner',
           franchiseOwnerEmail: matchingBranch.franchiseOwnerEmail || undefined,
@@ -809,8 +955,8 @@ router.get('/by-slug/:slug', requireRole(['owner', 'admin', 'developer', 'platfo
           createdAt: matchingBranch.createdAt || new Date().toISOString(),
           updatedAt: new Date().toISOString()
         };
-        await adminDb.collection('franchise_entities').doc(fId).set(newEntity, { merge: true });
-        await adminDb.collection('franchises').doc(matchingBranch.id).set({ franchiseId: fId }, { merge: true });
+        await withTimeout(adminDb.collection('franchise_entities').doc(fId).set(newEntity, { merge: true }), 'franchise.autoHealEntity', 1000).catch(() => {});
+        await withTimeout(adminDb.collection('franchises').doc(matchingBranch.id).set({ franchiseId: fId }, { merge: true }), 'franchise.autoHealBranch', 1000).catch(() => {});
         franchise = newEntity;
       }
     }
@@ -826,16 +972,31 @@ router.get('/by-slug/:slug', requireRole(['owner', 'admin', 'developer', 'platfo
       return;
     }
 
-    // Fetch associated branches
-    const bSnap = await adminDb.collection('franchises').get();
-    const branches = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => 
-        b.franchiseId === franchise!.id || 
-        b.franchiseId === `fra_${franchise!.slug}` ||
-        b.id === franchise!.mainBranchId ||
-        (franchise!.id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))
-      );
+    // Fetch associated branches (PG + bounded Firestore)
+    const [pgAssocRes, bSnap] = await Promise.all([
+      pgPool.query(
+        `SELECT id, franchise_id AS "franchiseId", name, address, phone, is_open AS "isOpen", accepting_orders AS "acceptingOrders",
+                current_prep_time AS "currentPrepTime", operating_hours AS "operatingHours", delivery_settings AS "deliverySettings",
+                latitude, longitude, metadata, created_at AS "createdAt"
+         FROM restaurant_branches
+         WHERE franchise_id = $1 OR franchise_id = $2 OR id = $3 OR ($1 = 'fra_rajnandgaon' AND (id = 'main_branch' OR franchise_id = 'fra_primary'))
+         ORDER BY created_at ASC`,
+        [franchise.id, `fra_${franchise.slug}`, franchise.mainBranchId || '']
+      ).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('franchises').get(), 'franchise.bySlugFetchBranches', 1200).catch(() => ({ docs: [] } as any))
+    ]);
+
+    const brMap = new Map<string, any>();
+    for (const r of pgAssocRes.rows) {
+      brMap.set(r.id, { ...r, ...(r.metadata && typeof r.metadata === 'object' ? r.metadata : {}) });
+    }
+    for (const d of bSnap.docs || []) {
+      const b = { id: d.id, ...(d.data() as any) };
+      if (b.franchiseId === franchise!.id || b.franchiseId === `fra_${franchise!.slug}` || b.id === franchise!.mainBranchId || (franchise!.id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))) {
+        brMap.set(d.id, brMap.has(d.id) ? { ...b, ...brMap.get(d.id) } : b);
+      }
+    }
+    const branches = Array.from(brMap.values());
 
     res.json({
       success: true,
@@ -856,22 +1017,40 @@ router.get('/:id', requireRole(['owner', 'admin', 'developer', 'platform_owner',
     const { id } = req.params;
     const scope = req.user?.scope || FranchiseScopeService.resolveScope(req.user);
 
-    // 1. Check in 'franchises' collection (branch-level)
-    let docSnap = await adminDb.collection('franchises').doc(id).get();
-    let data: any = docSnap.exists ? { id: docSnap.id, ...docSnap.data() } : null;
-
-    // 2. Check by franchiseId field in 'franchises' if not found
+    // 1. Check PostgreSQL restaurant_branches and franchises FIRST (quota-proof)
+    let data: any = null;
+    const pgBranch = await pgPool.query(
+      `SELECT id, franchise_id AS "franchiseId", name, address, phone, is_open AS "isOpen", accepting_orders AS "acceptingOrders",
+              current_prep_time AS "currentPrepTime", operating_hours AS "operatingHours", delivery_settings AS "deliverySettings",
+              latitude, longitude, metadata
+       FROM restaurant_branches WHERE id = $1 OR franchise_id = $1 ORDER BY (id = $1) DESC LIMIT 1`,
+      [id]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (pgBranch.rows[0]) {
+      const b = pgBranch.rows[0];
+      data = { ...b, ...(b.metadata && typeof b.metadata === 'object' ? b.metadata : {}) };
+    }
     if (!data) {
-      const snap = await adminDb.collection('franchises').where('franchiseId', '==', id).limit(1).get();
-      if (!snap.empty) {
-        data = { id: snap.docs[0].id, ...snap.docs[0].data() };
+      const pgFr = await pgPool.query(`SELECT id, name, status, owner_email AS "franchiseOwnerEmail" FROM franchises WHERE id = $1 LIMIT 1`, [id]).catch(() => ({ rows: [] as any[] }));
+      if (pgFr.rows[0]) {
+        data = { id: pgFr.rows[0].id, franchiseId: pgFr.rows[0].id, ...pgFr.rows[0] };
       }
     }
 
-    // 3. Check in 'franchise_entities' collection
+    // 2. Bounded Firestore fallback/enrichment
     if (!data) {
-      const entitySnap = await adminDb.collection('franchise_entities').doc(id).get();
-      if (entitySnap.exists) {
+      const docSnap = await withTimeout(adminDb.collection('franchises').doc(id).get(), 'franchise.getByIdBranch', 1200).catch(() => null);
+      data = docSnap?.exists ? { id: docSnap.id, ...docSnap.data() } : null;
+    }
+    if (!data) {
+      const snap = await withTimeout(adminDb.collection('franchises').where('franchiseId', '==', id).limit(1).get(), 'franchise.getByIdQuery', 1200).catch(() => null);
+      if (snap && !snap.empty) {
+        data = { id: snap.docs[0].id, ...snap.docs[0].data() };
+      }
+    }
+    if (!data) {
+      const entitySnap = await withTimeout(adminDb.collection('franchise_entities').doc(id).get(), 'franchise.getByIdEntity', 1200).catch(() => null);
+      if (entitySnap?.exists) {
         data = { id: entitySnap.id, ...entitySnap.data() };
       }
     }
@@ -881,8 +1060,8 @@ router.get('/:id', requireRole(['owner', 'admin', 'developer', 'platform_owner',
       return;
     }
 
-    // Scope check
-    if (!scope.isGlobalOwner && scope.franchiseId !== data.franchiseId && scope.franchiseId !== data.id && scope.franchiseId !== 'fra_rajnandgaon') {
+    // Scope check (strict franchise isolation — no hardcoded fra_rajnandgaon bypass)
+    if (!scope.isGlobalOwner && scope.franchiseId !== data.franchiseId && scope.franchiseId !== data.id) {
       res.status(403).json({ error: 'Access denied to this franchise', code: 'FORBIDDEN' });
       return;
     }
@@ -909,25 +1088,52 @@ router.get('/:id/dashboard', requireRole(['owner', 'admin', 'developer', 'platfo
       return;
     }
 
-    // Fetch branches for this franchise
-    const bSnap = await adminDb.collection('franchises').get();
-    const branches: any[] = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => 
-        b.franchiseId === id || 
-        b.franchiseId === `fra_${id}` || 
-        b.id === id || 
-        b.id === `${id}_branch` || 
-        (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))
-      );
+    // Fetch branches for this franchise (PG first + bounded Firestore merge)
+    const [pgBrRes, bSnap] = await Promise.all([
+      pgPool.query(
+        `SELECT id, franchise_id AS "franchiseId", name FROM restaurant_branches
+         WHERE franchise_id = $1 OR franchise_id = $2 OR id = $1 OR ($1 = 'fra_rajnandgaon' AND (id = 'main_branch' OR franchise_id = 'fra_primary'))`,
+        [id, `fra_${id}`]
+      ).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('franchises').get(), 'franchise.dashBranches', 1200).catch(() => ({ docs: [] } as any))
+    ]);
+
+    const brMap = new Map<string, any>();
+    for (const r of pgBrRes.rows) brMap.set(r.id, r);
+    for (const d of bSnap.docs || []) {
+      const b = { id: d.id, ...(d.data() as any) };
+      if (b.franchiseId === id || b.franchiseId === `fra_${id}` || b.id === id || b.id === `${id}_branch` || (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))) {
+        if (!brMap.has(d.id)) brMap.set(d.id, b);
+      }
+    }
+    const branches: any[] = Array.from(brMap.values());
 
     const targetBranchIds = branchFilter && branchFilter !== 'all'
       ? [branchFilter]
       : (branches.length > 0 ? branches.map(b => b.id) : [id]);
 
-    // Fetch orders for metrics
-    const orderSnap = await adminDb.collection('orders').where('franchiseId', '==', id).get().catch(async () => await adminDb.collection('orders').get().catch(() => ({ docs: [] } as any)));
-    const allOrders: any[] = orderSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+    // Authoritative PG orders query (merged with bounded Firestore fallback)
+    const orderMap = new Map<string, any>();
+    const pgOrdRes = await pgPool.query(
+      `SELECT id, franchise_id AS "franchiseId", branch_id AS "branchId", LOWER(order_status) AS status,
+              total_amount AS "totalAmount", order_source AS "orderSource", payment_method AS "paymentMethod",
+              order_type AS "fulfillmentType"
+       FROM canonical_orders
+       WHERE franchise_id = $1 OR branch_id = ANY($2::text[])
+       ORDER BY created_at DESC LIMIT 500`,
+      [id, targetBranchIds]
+    ).catch(() => ({ rows: [] as any[] }));
+    for (const row of pgOrdRes.rows) orderMap.set(row.id, row);
+
+    const orderSnap = await withTimeout(
+      adminDb.collection('orders').where('franchiseId', '==', id).get(),
+      'franchise.dashOrders',
+      1200
+    ).catch(() => ({ docs: [] } as any));
+    for (const d of orderSnap.docs || []) {
+      if (!orderMap.has(d.id)) orderMap.set(d.id, { id: d.id, ...(d.data() as any) });
+    }
+    const allOrders: any[] = Array.from(orderMap.values());
 
     const scopedOrders = allOrders.filter(o => {
       const bId = o.branchId || 'main_branch';
@@ -977,16 +1183,27 @@ router.get('/:id/dashboard', requireRole(['owner', 'admin', 'developer', 'platfo
       }
     });
 
-    // POS & Rider counts
-    const posSnap = await adminDb.collection('pos_terminals').get().catch(() => ({ docs: [] } as any));
-    const activeTerminals: any[] = posSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(t => targetBranchIds.includes(t.branchId) && t.isActive !== false);
+    // POS & Rider counts (PG authoritative + bounded Firestore)
+    const [posSnap, pgRiderRes, riderSnap] = await Promise.all([
+      withTimeout(adminDb.collection('pos_terminals').get(), 'franchise.dashPos', 1000).catch(() => ({ docs: [] } as any)),
+      pgPool.query(`SELECT id, branch_id, franchise_id, status FROM delivery_partners WHERE franchise_id = $1 OR branch_id = ANY($2::text[])`, [id, targetBranchIds]).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('delivery_partners').get(), 'franchise.dashRiders', 1000).catch(() => ({ docs: [] } as any))
+    ]);
+    const activeTerminals: any[] = (posSnap.docs || [])
+      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      .filter((t: any) => targetBranchIds.includes(t.branchId) && t.isActive !== false);
 
-    const riderSnap = await adminDb.collection('delivery_partners').get().catch(() => ({ docs: [] } as any));
-    const activeRiders: any[] = riderSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(r => (r.franchiseId === id || targetBranchIds.includes(r.branchId)) && r.isActive !== false);
+    const rMap = new Map<string, any>();
+    for (const r of pgRiderRes.rows) {
+      if (r.status === 'APPROVED') rMap.set(r.id, r);
+    }
+    for (const d of riderSnap.docs || []) {
+      const r = { id: d.id, ...(d.data() as any) };
+      if (!rMap.has(d.id) && (r.franchiseId === id || targetBranchIds.includes(r.branchId)) && r.isActive !== false) {
+        rMap.set(d.id, r);
+      }
+    }
+    const activeRiders: any[] = Array.from(rMap.values());
 
     res.json({
       success: true,
@@ -1025,12 +1242,37 @@ router.get('/:id/dashboard', requireRole(['owner', 'admin', 'developer', 'platfo
 router.get('/:id/branches', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner', 'restaurant_manager']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const bSnap = await adminDb.collection('franchises').get();
-    const branches: any[] = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary')));
+    const scope = FranchiseScopeService.resolveScope(req.user);
+    if (!scope.isGlobalOwner && scope.franchiseId !== id) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
 
-    res.json({ success: true, branches });
+    const [pgRes, bSnap] = await Promise.all([
+      pgPool.query(
+        `SELECT id, franchise_id AS "franchiseId", name, address, phone, is_open AS "isOpen", accepting_orders AS "acceptingOrders",
+                current_prep_time AS "currentPrepTime", operating_hours AS "operatingHours", delivery_settings AS "deliverySettings",
+                latitude, longitude, metadata, created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM restaurant_branches
+         WHERE franchise_id = $1 OR ($1 = 'fra_rajnandgaon' AND (id = 'main_branch' OR franchise_id = 'fra_primary'))
+         ORDER BY created_at ASC`,
+        [id]
+      ).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('franchises').get(), 'franchise.getBranches', 1200).catch(() => ({ docs: [] } as any))
+    ]);
+
+    const brMap = new Map<string, any>();
+    for (const r of pgRes.rows) {
+      brMap.set(r.id, { ...r, ...(r.metadata && typeof r.metadata === 'object' ? r.metadata : {}) });
+    }
+    for (const d of bSnap.docs || []) {
+      const b = { id: d.id, ...(d.data() as any) };
+      if (b.franchiseId === id || (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))) {
+        if (!brMap.has(d.id)) brMap.set(d.id, b);
+      }
+    }
+
+    res.json({ success: true, branches: Array.from(brMap.values()) });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to list franchise branches' });
   }
@@ -1062,7 +1304,7 @@ router.post('/:id/branches', requireRole(['owner', 'admin', 'developer', 'platfo
       lat: Number(lat) || 21.0810244,
       lng: Number(lng) || 81.0123793,
       phone: phone || '+91 91799 44445',
-      email: email || `branch.${branchId}@olivepizza.in`,
+      email: email ? String(email).trim().toLowerCase() : 'olivepizzarjn@gmail.com',
       maxDeliveryRadiusKm: Number(maxDeliveryRadiusKm) || 12,
       openingTime: openingTime || '12:00',
       closingTime: closingTime || '23:59',
@@ -1073,19 +1315,68 @@ router.post('/:id/branches', requireRole(['owner', 'admin', 'developer', 'platfo
       createdBy: req.user?.uid || 'owner'
     };
 
-    await adminDb.collection('franchises').doc(branchId).set(branchData, { merge: true });
+    const operatingHours = { open: branchData.openingTime, close: branchData.closingTime, isOpen: true };
+    const deliverySettings = {
+      radiusKm: branchData.maxDeliveryRadiusKm,
+      maxDeliveryRadiusKm: branchData.maxDeliveryRadiusKm,
+      baseDeliveryFee: 40,
+      freeDeliveryThreshold: 499,
+      minOrderAmount: 199
+    };
+    await query(
+      `INSERT INTO restaurant_branches (
+         id, franchise_id, name, address, phone, is_open, accepting_orders, current_prep_time,
+         operating_hours, delivery_settings, tax_settings, payment_settings, metadata, latitude, longitude, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, true, true, 20, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         franchise_id = EXCLUDED.franchise_id,
+         name = EXCLUDED.name,
+         address = EXCLUDED.address,
+         phone = EXCLUDED.phone,
+         operating_hours = EXCLUDED.operating_hours,
+         delivery_settings = EXCLUDED.delivery_settings,
+         metadata = COALESCE(restaurant_branches.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+         latitude = EXCLUDED.latitude,
+         longitude = EXCLUDED.longitude,
+         updated_at = NOW()`,
+      [
+        branchId,
+        id,
+        branchData.name,
+        branchData.address,
+        branchData.phone,
+        JSON.stringify(operatingHours),
+        JSON.stringify(deliverySettings),
+        JSON.stringify({ gstPercentage: 5, packagingCharge: 20 }),
+        JSON.stringify({ upi: true, cards: true, onlineGateway: true, cashOnDelivery: true }),
+        JSON.stringify({
+          code: branchData.code,
+          city: branchData.city,
+          state: branchData.state,
+          email: branchData.email,
+          organizationId: branchData.organizationId,
+          createdBy: branchData.createdBy
+        }),
+        branchData.lat,
+        branchData.lng
+      ]
+    );
+    CustomerOrderingContextService.invalidateBranchesSnapshot();
 
-    await FranchiseScopeService.logFranchiseAudit({
+    await withTimeout(adminDb.collection('franchises').doc(branchId).set(branchData, { merge: true }), 'branchFirestoreSet', 1500).catch(() => {});
+
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       organizationId: branchData.organizationId,
       franchiseId: id,
       branchId: branchData.id,
       actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in',
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
       actionType: 'BRANCH_CREATED',
       entityType: 'franchise_branch',
       entityId: branchId,
       details: branchData
-    });
+    }), 'branchCreateAudit', 1200).catch(() => {});
 
     res.status(201).json({ success: true, branch: branchData });
   } catch (error: any) {
@@ -1103,19 +1394,62 @@ router.get('/:id/managers', requireRole(['owner', 'admin', 'developer', 'platfor
       return;
     }
 
-    const bSnap = await adminDb.collection('franchises').get();
-    const branchIds = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && b.id === 'main_branch'))
-      .map(b => b.id);
+    const mgrMap = new Map<string, any>();
+    try {
+      const pgRes = await query(
+        `SELECT id, firebase_uid, name, email, phone, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata, created_at, updated_at
+         FROM app_users
+         WHERE (role = 'restaurant_manager' OR allowed_apps ? 'RESTAURANT_MANAGER')
+           AND (franchise_id = $1 OR ($1 = 'fra_rajnandgaon' AND branch_id IN ('main_branch', 'branch_rjn_main')))
+         ORDER BY updated_at DESC`,
+        [id]
+      );
+      for (const r of pgRes.rows) {
+        const key = String(r.email || r.id).toLowerCase();
+        mgrMap.set(key, {
+          id: r.id,
+          uid: r.firebase_uid || r.id,
+          name: r.name,
+          email: r.email,
+          phone: r.phone || '',
+          role: r.role || 'restaurant_manager',
+          status: r.status || 'APPROVED',
+          franchiseId: r.franchise_id,
+          branchId: r.branch_id || 'main_branch',
+          isActive: r.is_active !== false,
+          permissions: Array.isArray(r.metadata?.permissions) ? r.metadata.permissions : ['dashboard.view', 'orders.live', 'orders.history', 'inventory.view'],
+          hasPin: Boolean(r.metadata?.hasPin),
+          createdAt: r.created_at,
+          updatedAt: r.updated_at
+        });
+      }
+    } catch (pgErr: any) {
+      console.warn('[FranchiseRoutes] PG manager list warning:', pgErr.message);
+    }
 
-    const mgrSnap = await adminDb.collection('restaurant_managers').get();
-    const managers: any[] = mgrSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(m => m.franchiseId === id || branchIds.includes(m.branchId))
-      .map(({ pinHash, ...safe }) => safe);
+    try {
+      const [bSnap, mgrSnap] = await Promise.all([
+        withTimeout(adminDb.collection('franchises').get(), 'mgrBranchesSnap', 1500),
+        withTimeout(adminDb.collection('restaurant_managers').get(), 'mgrSnap', 1500)
+      ]);
+      const branchIds = bSnap
+        ? bSnap.docs
+            .map(d => ({ id: d.id, ...(d.data() as any) }))
+            .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && b.id === 'main_branch'))
+            .map(b => b.id)
+        : [];
+      if (mgrSnap) {
+        for (const d of mgrSnap.docs) {
+          const { pinHash, ...safe } = { id: d.id, ...(d.data() as any) };
+          if (safe.franchiseId === id || branchIds.includes(safe.branchId)) {
+            const key = String(safe.email || safe.id).toLowerCase();
+            if (!mgrMap.has(key)) mgrMap.set(key, safe);
+          }
+        }
+      }
+    } catch { /* Firestore fallback bounded */ }
 
-    res.json({ success: true, managers });
+    res.json({ success: true, managers: Array.from(mgrMap.values()) });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to list restaurant managers' });
   }
@@ -1125,13 +1459,50 @@ router.get('/:id/managers', requireRole(['owner', 'admin', 'developer', 'platfor
 router.get('/:id/restaurant-managers/pending', requireRole(['owner', 'admin', 'developer', 'platform_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const snap = await adminDb.collection('restaurant_managers').where('status', '==', 'PENDING_OWNER_APPROVAL').get();
-    let pending = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
-    if (id !== 'all') {
-      pending = pending.filter(m => m.franchiseId === id);
+    const pendingMap = new Map<string, any>();
+    try {
+      const pgRes = await query(
+        `SELECT id, firebase_uid, name, email, phone, role, status, franchise_id, branch_id, is_active, created_at, updated_at
+         FROM app_users
+         WHERE status = 'PENDING_OWNER_APPROVAL'
+           AND (role = 'restaurant_manager' OR allowed_apps ? 'RESTAURANT_MANAGER')
+           AND ($1 = 'all' OR franchise_id = $1)`,
+        [id]
+      );
+      for (const r of pgRes.rows) {
+        pendingMap.set(String(r.email || r.id).toLowerCase(), {
+          id: r.id,
+          uid: r.firebase_uid || r.id,
+          name: r.name,
+          email: r.email,
+          phone: r.phone || '',
+          role: r.role || 'restaurant_manager',
+          status: r.status,
+          franchiseId: r.franchise_id,
+          branchId: r.branch_id || 'main_branch',
+          isActive: r.is_active !== false,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at
+        });
+      }
+    } catch { /* fallback to Firestore */ }
+
+    const snap = await withTimeout(
+      adminDb.collection('restaurant_managers').where('status', '==', 'PENDING_OWNER_APPROVAL').get(),
+      'pendingMgrsSnap',
+      1500
+    ).catch(() => null);
+    if (snap) {
+      let pending = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      if (id !== 'all') {
+        pending = pending.filter(m => m.franchiseId === id);
+      }
+      for (const { pinHash, ...safe } of pending) {
+        const key = String(safe.email || safe.id).toLowerCase();
+        if (!pendingMap.has(key)) pendingMap.set(key, safe);
+      }
     }
-    const safePending = pending.map(({ pinHash, ...safe }) => safe);
-    res.json({ success: true, pending: safePending });
+    res.json({ success: true, pending: Array.from(pendingMap.values()) });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch pending managers' });
   }
@@ -1141,41 +1512,71 @@ router.get('/:id/restaurant-managers/pending', requireRole(['owner', 'admin', 'd
 router.post('/:id/restaurant-managers/:managerId/approve', requireRole(['owner', 'admin', 'developer', 'platform_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id, managerId } = req.params;
-    const mgrRef = adminDb.collection('restaurant_managers').doc(managerId);
-    const mgrDoc = await mgrRef.get();
+    const now = new Date().toISOString();
 
-    if (!mgrDoc.exists) {
+    const pgUpdate = await query(
+      `UPDATE app_users
+       SET role = 'restaurant_manager',
+           status = 'APPROVED',
+           is_active = true,
+           allowed_apps = '["RESTAURANT_MANAGER"]'::jsonb,
+           updated_at = NOW()
+       WHERE id = $1 OR firebase_uid = $1 OR LOWER(email) = LOWER($1)
+       RETURNING id, firebase_uid, email, name, franchise_id, branch_id`,
+      [managerId]
+    ).catch(() => ({ rows: [] as any[] }));
+    const pgRow = pgUpdate.rows[0];
+
+    const mgrRef = adminDb.collection('restaurant_managers').doc(managerId);
+    const mgrDoc = await withTimeout(mgrRef.get(), 'approveMgrGet', 1500).catch(() => null);
+
+    if (!pgRow && (!mgrDoc || !mgrDoc.exists)) {
       res.status(404).json({ error: 'Restaurant Manager record not found' });
       return;
     }
 
-    const now = new Date().toISOString();
-    await mgrRef.set({
-      status: 'APPROVED',
-      approvedAt: now,
-      approvedByUid: req.user?.uid || 'owner',
-      approvedByEmail: req.user?.email || 'owner@olivepizza.in',
-      updatedAt: now
-    }, { merge: true });
+    const uid = pgRow?.firebase_uid || pgRow?.id || mgrDoc?.data()?.uid || managerId;
+    const mgrEmail = pgRow?.email || mgrDoc?.data()?.email;
+    const targetFranchiseId = pgRow?.franchise_id || mgrDoc?.data()?.franchiseId || id;
+    const targetBranchId = pgRow?.branch_id || mgrDoc?.data()?.branchId || 'main_branch';
+
+    if (adminAuth && uid) {
+      await adminAuth.setCustomUserClaims(uid, {
+        role: 'restaurant_manager',
+        allowedApps: ['RESTAURANT_MANAGER'],
+        franchiseId: targetFranchiseId,
+        branchId: targetBranchId
+      }).catch(() => {});
+    }
+
+    if (mgrDoc && mgrDoc.exists) {
+      await withTimeout(mgrRef.set({
+        status: 'APPROVED',
+        approvedAt: now,
+        approvedByUid: req.user?.uid || 'owner',
+        approvedByEmail: req.user?.email || 'olivepizzarjn@gmail.com',
+        updatedAt: now
+      }, { merge: true }), 'approveMgrSet', 1500).catch(() => {});
+    }
 
     // Also update users collection if exists
-    const uid = mgrDoc.data()?.uid || managerId;
-    await adminDb.collection('users').doc(uid).set({
+    await withTimeout(adminDb.collection('users').doc(uid).set({
       role: 'restaurant_manager',
       status: 'APPROVED',
+      allowedApps: ['RESTAURANT_MANAGER'],
       isActive: true,
       updatedAt: now
-    }, { merge: true }).catch(() => {});
+    }, { merge: true }), 'approveUserSet', 1500).catch(() => {});
 
-    await FranchiseScopeService.logFranchiseAudit({
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       franchiseId: id,
       actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in',
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
       actionType: 'RESTAURANT_MANAGER_APPROVED',
       entityType: 'restaurant_manager',
       entityId: managerId,
-      details: { managerId, email: mgrDoc.data()?.email }
-    });
+      details: { managerId, email: mgrEmail }
+    }), 'approveMgrAudit', 1200).catch(() => {});
 
     res.json({ success: true, message: 'Restaurant Manager approved successfully' });
   } catch (error: any) {
@@ -1253,15 +1654,31 @@ router.post('/:id/managers', requireRole(['owner', 'admin', 'developer', 'platfo
     }
 
     // Atomic Uniqueness Constraint: Max 1 active/pending Restaurant Manager account per franchise
-    const existingMgrsSnap = await adminDb.collection('restaurant_managers')
-      .where('franchiseId', '==', id)
-      .get();
-    const existingActive = existingMgrsSnap.docs.filter(d => {
-      const data = d.data();
-      return data.isActive !== false && ['APPROVED', 'PENDING_OWNER_APPROVAL'].includes(data.status || 'APPROVED');
-    });
+    const pgExistingMgr = await query(
+      `SELECT id FROM app_users
+       WHERE franchise_id = $1
+         AND is_active = true
+         AND status IN ('APPROVED', 'PENDING_OWNER_APPROVAL')
+         AND (role = 'restaurant_manager' OR allowed_apps ? 'RESTAURANT_MANAGER')
+       LIMIT 1`,
+      [id]
+    ).catch(() => ({ rows: [] as any[] }));
 
-    if (existingActive.length > 0) {
+    const existingMgrsSnap = await withTimeout(
+      adminDb.collection('restaurant_managers')
+        .where('franchiseId', '==', id)
+        .get(),
+      'createMgrCheck',
+      1500
+    ).catch(() => null);
+    const existingActive = existingMgrsSnap
+      ? existingMgrsSnap.docs.filter(d => {
+          const data = d.data();
+          return data.isActive !== false && ['APPROVED', 'PENDING_OWNER_APPROVAL'].includes(data.status || 'APPROVED');
+        })
+      : [];
+
+    if (pgExistingMgr.rows.length > 0 || existingActive.length > 0) {
       res.status(409).json({
         error: 'A Restaurant Manager account already exists for this franchise. Maximum 1 account permitted.',
         code: 'LIMIT_EXCEEDED'
@@ -1270,6 +1687,13 @@ router.post('/:id/managers', requireRole(['owner', 'admin', 'developer', 'platfo
     }
 
     const cleanEmail = email.trim().toLowerCase();
+    if (FranchiseScopeService.isGlobalOwner(cleanEmail, undefined)) {
+      res.status(409).json({
+        error: `${cleanEmail} is a platform owner account and cannot be assigned as a restaurant manager.`,
+        code: 'PROTECTED_ACCOUNT_CANNOT_BE_ASSIGNED'
+      });
+      return;
+    }
     const mgrId = `mgr_${cleanEmail.replace(/[^a-z0-9]/g, '_')}`;
     const now = new Date().toISOString();
 
@@ -1310,37 +1734,85 @@ router.post('/:id/managers', requireRole(['owner', 'admin', 'developer', 'platfo
       createdAt: now,
       updatedAt: now,
       invitedBy: req.user?.uid || 'franchise_manager',
-      invitedByEmail: req.user?.email || 'manager@olivepizza.in'
+      invitedByEmail: req.user?.email || 'olivepizzarjn@gmail.com'
     };
 
-    await adminDb.collection('restaurant_managers').doc(mgrId).set(managerData, { merge: true });
-    if (targetUid !== mgrId) {
-      await adminDb.collection('restaurant_managers').doc(targetUid).set(managerData, { merge: true });
+    await query(
+      `INSERT INTO app_users (
+         id, firebase_uid, email, phone, name, role, status,
+         franchise_id, branch_id, allowed_apps, is_active, metadata, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, 'restaurant_manager', $6, $7, $8, '["RESTAURANT_MANAGER"]'::jsonb, true, $9::jsonb, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         firebase_uid = COALESCE(EXCLUDED.firebase_uid, app_users.firebase_uid),
+         email = EXCLUDED.email,
+         phone = EXCLUDED.phone,
+         name = EXCLUDED.name,
+         role = 'restaurant_manager',
+         status = EXCLUDED.status,
+         franchise_id = EXCLUDED.franchise_id,
+         branch_id = EXCLUDED.branch_id,
+         allowed_apps = '["RESTAURANT_MANAGER"]'::jsonb,
+         is_active = true,
+         metadata = COALESCE(app_users.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+         updated_at = NOW()`,
+      [
+        targetUid,
+        targetUid,
+        cleanEmail,
+        managerData.phone,
+        managerData.name,
+        initialStatus,
+        id,
+        managerData.branchId,
+        JSON.stringify({
+          permissions: managerData.permissions,
+          hasPin: true,
+          pinHash,
+          invitedBy: managerData.invitedBy,
+          invitedByEmail: managerData.invitedByEmail
+        })
+      ]
+    );
+
+    if (adminAuth) {
+      await adminAuth.setCustomUserClaims(targetUid, {
+        role: 'restaurant_manager',
+        allowedApps: ['RESTAURANT_MANAGER'],
+        franchiseId: id,
+        branchId: managerData.branchId
+      }).catch(() => {});
     }
 
-    await adminDb.collection('users').doc(targetUid).set({
+    await withTimeout(adminDb.collection('restaurant_managers').doc(mgrId).set(managerData, { merge: true }), 'mgrSetById', 1500).catch(() => {});
+    if (targetUid !== mgrId) {
+      await withTimeout(adminDb.collection('restaurant_managers').doc(targetUid).set(managerData, { merge: true }), 'mgrSetByUid', 1500).catch(() => {});
+    }
+
+    await withTimeout(adminDb.collection('users').doc(targetUid).set({
       uid: targetUid,
       name: managerData.name,
       email: cleanEmail,
       role: 'restaurant_manager',
       status: initialStatus,
+      allowedApps: ['RESTAURANT_MANAGER'],
       franchiseId: id,
       branchId: managerData.branchId,
       isActive: true,
       updatedAt: now
-    }, { merge: true }).catch(() => {});
+    }, { merge: true }), 'mgrUserSet', 1500).catch(() => {});
 
-    await FranchiseScopeService.logFranchiseAudit({
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       organizationId: managerData.organizationId,
       franchiseId: id,
       branchId: managerData.branchId,
       actorUid: req.user?.uid || 'franchise_manager',
-      actorEmail: req.user?.email || 'manager@olivepizza.in',
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
       actionType: 'MANAGER_PROVISIONED',
       entityType: 'restaurant_manager',
       entityId: mgrId,
       details: { name: managerData.name, email: cleanEmail, status: initialStatus, branchId: managerData.branchId }
-    });
+    }), 'mgrAudit', 1200).catch(() => {});
 
     const { pinHash: _omitted, ...safeManagerData } = managerData;
     res.status(201).json({ success: true, manager: safeManagerData });
@@ -1546,12 +2018,60 @@ router.get('/:id/riders', requireRole(['owner', 'admin', 'developer', 'platform_
       return;
     }
 
-    const riderSnap = await adminDb.collection('delivery_partners').get();
-    const riders: any[] = riderSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(r => r.franchiseId === id || (id === 'fra_rajnandgaon' && (!r.franchiseId || r.branchId === 'main_branch')));
+    const riderMap = new Map<string, any>();
+    try {
+      const pgRes = await query(
+        `SELECT id, user_id, name, phone, email, franchise_id, branch_id, vehicle_type, vehicle_number,
+                is_online, status, current_lat, current_lng, last_location_time, active_order_id,
+                total_deliveries, metadata, created_at, updated_at
+         FROM delivery_partners
+         WHERE franchise_id = $1
+            OR ($1 = 'fra_rajnandgaon' AND (franchise_id IS NULL OR branch_id IN ('main_branch', 'branch_rjn_main')))
+         ORDER BY updated_at DESC`,
+        [id]
+      );
+      for (const r of pgRes.rows) {
+        const key = String(r.email || r.user_id || r.id).toLowerCase();
+        riderMap.set(key, {
+          id: r.id,
+          uid: r.user_id || r.id,
+          name: r.name,
+          phone: r.phone,
+          email: r.email || '',
+          role: 'delivery_partner',
+          franchiseId: r.franchise_id || id,
+          branchId: r.branch_id || 'main_branch',
+          vehicleType: r.vehicle_type || 'bike',
+          vehicleNumber: r.vehicle_number || '',
+          isOnline: Boolean(r.is_online),
+          isActive: (r.status || 'APPROVED').toUpperCase() !== 'SUSPENDED',
+          status: r.status || 'APPROVED',
+          currentLocation: r.current_lat != null && r.current_lng != null ? { lat: Number(r.current_lat), lng: Number(r.current_lng) } : undefined,
+          lastLocationTime: r.last_location_time,
+          activeOrderId: r.active_order_id || null,
+          totalDeliveries: Number(r.total_deliveries || 0),
+          createdAt: r.created_at,
+          updatedAt: r.updated_at
+        });
+      }
+    } catch (pgErr: any) {
+      console.warn('[FranchiseRoutes] PG rider list warning:', pgErr.message);
+    }
 
-    res.json({ success: true, riders });
+    try {
+      const riderSnap = await withTimeout(adminDb.collection('delivery_partners').get(), 'ridersFirestoreList', 1500);
+      if (riderSnap) {
+        for (const d of riderSnap.docs) {
+          const data: any = { id: d.id, ...(d.data() as any) };
+          if (data.franchiseId === id || (id === 'fra_rajnandgaon' && (!data.franchiseId || data.branchId === 'main_branch'))) {
+            const key = String(data.email || data.uid || data.id).toLowerCase();
+            if (!riderMap.has(key)) riderMap.set(key, data);
+          }
+        }
+      }
+    } catch { /* Firestore fallback bounded */ }
+
+    res.json({ success: true, riders: Array.from(riderMap.values()) });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to list delivery partners' });
   }
@@ -1568,17 +2088,20 @@ router.post('/:id/riders', requireRole(['owner', 'admin', 'developer', 'platform
 
     const { name, email, phone, branchId, vehicleNumber } = req.body;
 
-    if (!name || !phone) {
-      res.status(400).json({ error: 'Rider name and phone number are required' });
+    if (!name || !phone || !email || !String(email).trim()) {
+      res.status(400).json({ error: 'Rider name, real email, and phone number are required' });
       return;
     }
 
-    const cleanPhone = phone.trim().replace(/[^\d+]/g, '');
-    const cleanEmail = email ? email.trim().toLowerCase() : `rider.${cleanPhone.replace(/\D/g, '')}@olivepizza.in`;
-    const riderId = `rider_${cleanPhone.replace(/\D/g, '').slice(-6)}_${Date.now().toString().slice(-4)}`;
-    const now = new Date().toISOString();
+    const cleanPhone = String(phone).trim().replace(/[^\d+]/g, '');
+    const cleanEmail = String(email).trim().toLowerCase();
+    if (FranchiseScopeService.isGlobalOwner(cleanEmail, undefined)) {
+      res.status(409).json({ error: `${cleanEmail} is a platform owner account and cannot be assigned as a delivery rider.` });
+      return;
+    }
 
-    let targetUid = riderId;
+    const now = new Date().toISOString();
+    let targetUid = `rider_${cleanPhone.replace(/\D/g, '').slice(-6)}_${Date.now().toString().slice(-4)}`;
     try {
       const existingAuth = await adminAuth.getUserByEmail(cleanEmail);
       targetUid = existingAuth.uid;
@@ -1588,16 +2111,16 @@ router.post('/:id/riders', requireRole(['owner', 'admin', 'developer', 'platform
         const createdAuth = await adminAuth.createUser({
           email: cleanEmail,
           password: secureRandomPassword,
-          displayName: name.trim()
+          displayName: String(name).trim()
         });
         targetUid = createdAuth.uid;
       }
     }
 
     const riderData = {
-      id: riderId,
+      id: targetUid,
       uid: targetUid,
-      name: name.trim(),
+      name: String(name).trim(),
       email: cleanEmail,
       phone: cleanPhone,
       role: 'delivery_partner',
@@ -1606,94 +2129,89 @@ router.post('/:id/riders', requireRole(['owner', 'admin', 'developer', 'platform
       branchId: branchId || 'main_branch',
       vehicleNumber: vehicleNumber || '',
       isActive: true,
-      status: 'ACTIVE',
+      status: 'APPROVED',
       isOnline: false,
       rating: 5.0,
       totalDeliveries: 0,
       createdAt: now,
       updatedAt: now,
       createdBy: req.user?.uid || 'franchise_manager',
-      createdByEmail: req.user?.email || 'manager@olivepizza.in'
+      createdByEmail: req.user?.email || 'olivepizzarjn@gmail.com'
     };
 
-    await adminDb.collection('delivery_partners').doc(riderId).set(riderData, { merge: true });
-    if (targetUid !== riderId) {
-      await adminDb.collection('delivery_partners').doc(targetUid).set(riderData, { merge: true });
+    // Synchronize to PostgreSQL delivery_partners and app_users tables FIRST
+    await query(
+      `INSERT INTO delivery_partners (id, user_id, name, phone, email, franchise_id, branch_id, status, is_online, vehicle_number, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPROVED', false, $8, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         user_id = COALESCE(EXCLUDED.user_id, delivery_partners.user_id),
+         name = EXCLUDED.name,
+         phone = EXCLUDED.phone,
+         email = EXCLUDED.email,
+         franchise_id = EXCLUDED.franchise_id,
+         branch_id = EXCLUDED.branch_id,
+         status = 'APPROVED',
+         vehicle_number = EXCLUDED.vehicle_number,
+         updated_at = NOW()`,
+      [targetUid, targetUid, riderData.name, cleanPhone, cleanEmail, id, riderData.branchId, riderData.vehicleNumber]
+    );
+    await query(
+      `INSERT INTO app_users (id, firebase_uid, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'delivery_partner', 'APPROVED', $6, $7, '["DELIVERY"]'::jsonb, true, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         firebase_uid = COALESCE(EXCLUDED.firebase_uid, app_users.firebase_uid),
+         name = EXCLUDED.name,
+         phone = EXCLUDED.phone,
+         email = EXCLUDED.email,
+         role = 'delivery_partner',
+         status = 'APPROVED',
+         franchise_id = EXCLUDED.franchise_id,
+         branch_id = EXCLUDED.branch_id,
+         allowed_apps = '["DELIVERY"]'::jsonb,
+         is_active = true,
+         updated_at = NOW()`,
+      [targetUid, targetUid, cleanEmail, cleanPhone, riderData.name, id, riderData.branchId]
+    );
+
+    // Set active Firebase custom claims
+    if (adminAuth) {
+      await adminAuth.setCustomUserClaims(targetUid, {
+        role: 'delivery_partner',
+        allowedApps: ['DELIVERY'],
+        franchiseId: id,
+        branchId: riderData.branchId
+      }).catch((claimErr: any) => {
+        console.warn('[FranchiseRoutes] Custom claims warning on rider provision:', claimErr.message);
+      });
     }
 
-    await adminDb.collection('users').doc(targetUid).set({
+    await withTimeout(adminDb.collection('delivery_partners').doc(targetUid).set(riderData, { merge: true }), 'riderPartnerSet', 1500).catch(() => {});
+    await withTimeout(adminDb.collection('users').doc(targetUid).set({
       uid: targetUid,
       name: riderData.name,
       email: cleanEmail,
       phone: cleanPhone,
       phoneVerified: true,
       role: 'delivery_partner',
+      allowedApps: ['DELIVERY'],
       franchiseId: id,
       branchId: riderData.branchId,
       isActive: true,
       vehicleNumber: riderData.vehicleNumber,
       updatedAt: now
-    }, { merge: true }).catch(() => {});
+    }, { merge: true }), 'riderUserSet', 1500).catch(() => {});
 
-    // Set active Firebase custom claims
-    try {
-      await adminAuth.setCustomUserClaims(targetUid, {
-        role: 'delivery_partner',
-        allowedApps: ['DELIVERY'],
-        franchiseId: id,
-        branchId: riderData.branchId
-      });
-    } catch (claimErr: any) {
-      console.warn('[FranchiseRoutes] Custom claims warning on rider provision:', claimErr.message);
-    }
-
-    // Synchronize to PostgreSQL delivery_partners and app_users tables
-    try {
-      await query(
-        `INSERT INTO delivery_partners (id, name, phone, email, franchise_id, branch_id, status, is_online, vehicle_number, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'APPROVED', false, $7, NOW())
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           phone = EXCLUDED.phone,
-           email = EXCLUDED.email,
-           franchise_id = EXCLUDED.franchise_id,
-           branch_id = EXCLUDED.branch_id,
-           status = 'APPROVED',
-           vehicle_number = EXCLUDED.vehicle_number,
-           updated_at = NOW()`,
-        [targetUid, riderData.name, cleanPhone, cleanEmail, id, riderData.branchId, riderData.vehicleNumber]
-      );
-      await query(
-        `INSERT INTO app_users (id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, updated_at)
-         VALUES ($1, $2, $3, $4, 'delivery_partner', 'APPROVED', $5, $6, '["DELIVERY"]'::jsonb, true, NOW())
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           phone = EXCLUDED.phone,
-           email = EXCLUDED.email,
-           role = 'delivery_partner',
-           status = 'APPROVED',
-           franchise_id = EXCLUDED.franchise_id,
-           branch_id = EXCLUDED.branch_id,
-           allowed_apps = '["DELIVERY"]'::jsonb,
-           is_active = true,
-           updated_at = NOW()`,
-        [targetUid, cleanEmail, cleanPhone, riderData.name, id, riderData.branchId]
-      );
-    } catch (pgSyncErr: any) {
-      console.warn('[FranchiseRoutes] PostgreSQL rider sync notice:', pgSyncErr.message);
-    }
-
-    await FranchiseScopeService.logFranchiseAudit({
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       organizationId: FranchiseScopeService.DEFAULT_ORG_ID,
       franchiseId: id,
       branchId: riderData.branchId,
       actorUid: req.user?.uid || 'franchise_manager',
-      actorEmail: req.user?.email || 'manager@olivepizza.in',
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
       actionType: 'RIDER_PROVISIONED',
       entityType: 'delivery_partner',
-      entityId: riderId,
+      entityId: targetUid,
       details: { name: riderData.name, email: cleanEmail, phone: cleanPhone, franchiseId: id }
-    });
+    }), 'riderAudit', 1200).catch(() => {});
 
     res.status(201).json({ success: true, rider: riderData });
   } catch (error: any) {
@@ -2154,24 +2672,84 @@ router.get('/:id/orders/live', requireRole(['owner', 'admin', 'developer', 'plat
       res.status(403).json({ error: 'Unauthorized: Scope mismatch', code: 'FORBIDDEN' });
       return;
     }
-    const bSnap = await adminDb.collection('franchises').get();
-    const branchIds = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && b.id === 'main_branch'))
-      .map(b => b.id);
 
-    const orderSnap = await adminDb.collection('orders').limit(100).get();
-    const activeStatuses = ['pending', 'accepted', 'preparing', 'partner_assigned', 'ready', 'picked_up', 'out_for_delivery'];
+    const orderMap = new Map<string, any>();
+    try {
+      const pgRes = await query(
+        `SELECT id, daily_order_no, permanent_bill_no, order_status, order_source, order_type,
+                customer_name, customer_phone, delivery_address, subtotal, discount_amount,
+                tax_amount, cgst, sgst, delivery_fee, total_amount, payment_method, payment_status,
+                franchise_id, branch_id, delivery_partner_id, delivery_partner_name, delivery_partner_phone,
+                estimated_preparation_minutes, expected_ready_at, created_at, updated_at
+         FROM canonical_orders
+         WHERE (franchise_id = $1 OR ($1 = 'fra_rajnandgaon' AND (franchise_id = 'fra_primary' OR branch_id IN ('main_branch', 'branch_rjn_main'))))
+           AND UPPER(order_status) IN ('PENDING', 'ACCEPTED', 'PREPARING', 'PARTNER_ASSIGNED', 'READY', 'PICKED_UP', 'OUT_FOR_DELIVERY')
+         ORDER BY created_at DESC
+         LIMIT 100`,
+        [id]
+      );
+      for (const r of pgRes.rows) {
+        orderMap.set(r.id, {
+          id: r.id,
+          orderNumber: r.daily_order_no ? `OLV-${r.daily_order_no}` : r.id,
+          permanentBillNo: r.permanent_bill_no ? Number(r.permanent_bill_no) : undefined,
+          status: String(r.order_status || 'PENDING').toLowerCase(),
+          orderSource: r.order_source,
+          orderType: r.order_type,
+          customerName: r.customer_name,
+          customerPhone: r.customer_phone,
+          deliveryAddress: r.delivery_address,
+          subtotal: Number(r.subtotal || 0),
+          discountAmount: Number(r.discount_amount || 0),
+          taxAmount: Number(r.tax_amount || 0),
+          cgst: Number(r.cgst || 0),
+          sgst: Number(r.sgst || 0),
+          deliveryFee: Number(r.delivery_fee || 0),
+          totalAmount: Number(r.total_amount || 0),
+          currency: 'INR',
+          paymentMethod: r.payment_method,
+          paymentStatus: r.payment_status,
+          franchiseId: r.franchise_id,
+          branchId: r.branch_id,
+          deliveryPartnerId: r.delivery_partner_id,
+          deliveryPartnerName: r.delivery_partner_name,
+          deliveryPartnerPhone: r.delivery_partner_phone,
+          estimatedPreparationMinutes: r.estimated_preparation_minutes,
+          expectedReadyAt: r.expected_ready_at,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at
+        });
+      }
+    } catch (pgErr: any) {
+      console.warn('[FranchiseRoutes] PG live orders warning:', pgErr.message);
+    }
 
-    const liveOrders = orderSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(o => {
-        const bId = o.branchId || 'main_branch';
-        const s = (o.status || 'pending').toLowerCase();
-        return (branchIds.includes(bId) || (id === 'fra_rajnandgaon' && bId === 'main_branch')) && activeStatuses.includes(s);
-      });
+    try {
+      const [bSnap, orderSnap] = await Promise.all([
+        withTimeout(adminDb.collection('franchises').get(), 'liveOrdersBranches', 1500),
+        withTimeout(adminDb.collection('orders').limit(100).get(), 'liveOrdersSnap', 1500)
+      ]);
+      const branchIds = bSnap
+        ? bSnap.docs
+            .map(d => ({ id: d.id, ...(d.data() as any) }))
+            .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && b.id === 'main_branch'))
+            .map(b => b.id)
+        : [];
+      const activeStatuses = ['pending', 'accepted', 'preparing', 'partner_assigned', 'ready', 'picked_up', 'out_for_delivery'];
+      if (orderSnap) {
+        for (const d of orderSnap.docs) {
+          if (orderMap.has(d.id)) continue;
+          const o = { id: d.id, ...(d.data() as any) };
+          const bId = o.branchId || 'main_branch';
+          const s = (o.status || 'pending').toLowerCase();
+          if ((branchIds.includes(bId) || (id === 'fra_rajnandgaon' && bId === 'main_branch')) && activeStatuses.includes(s)) {
+            orderMap.set(d.id, o);
+          }
+        }
+      }
+    } catch { /* Firestore fallback bounded */ }
 
-    res.json({ success: true, orders: liveOrders });
+    res.json({ success: true, orders: Array.from(orderMap.values()), currency: 'INR', timezone: 'Asia/Kolkata' });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch live orders for franchise' });
   }
@@ -2186,36 +2764,19 @@ router.get('/:id/reports', requireRole(['owner', 'admin', 'developer', 'platform
       res.status(403).json({ error: 'Unauthorized: Scope mismatch', code: 'FORBIDDEN' });
       return;
     }
-    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
-    const monthStart = `${currentMonth}-01T00:00:00.000Z`;
-    const monthEnd = new Date(new Date(monthStart).setMonth(new Date(monthStart).getMonth() + 1)).toISOString();
 
-    // 1. Resolve branch IDs belonging to this franchise
-    const bSnap = await adminDb.collection('franchises').get().catch(() => ({ docs: [] } as any));
-    const branchIds = bSnap.docs
-      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
-      .filter((b: any) => 
-        b.franchiseId === id || 
-        b.franchiseId === `fra_${id}` || 
-        b.id === id || 
-        b.id === `${id}_branch` || 
-        (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))
-      )
-      .map((b: any) => b.id);
-    if (!branchIds.includes(id)) branchIds.push(id);
-
-    // 2. Query orders
-    const orderSnap = await adminDb.collection('orders').where('franchiseId', '==', id).get().catch(async () => await adminDb.collection('orders').get().catch(() => ({ docs: [] } as any)));
-
-    const parseOrderIso = (val: any): string => {
-      if (!val) return '';
-      if (typeof val === 'string') return val;
-      if (val.toDate && typeof val.toDate === 'function') return val.toDate().toISOString();
-      if (typeof val._seconds === 'number') return new Date(val._seconds * 1000).toISOString();
-      if (typeof val.seconds === 'number') return new Date(val.seconds * 1000).toISOString();
-      if (val instanceof Date) return val.toISOString();
-      return '';
-    };
+    // India Standard Time (Asia/Kolkata, +05:30) monthly window
+    const istToday = getIstDateKey();
+    const currentMonth = istToday.slice(0, 7); // YYYY-MM
+    const [yrStr, moStr] = currentMonth.split('-');
+    const yr = Number(yrStr);
+    const mo = Number(moStr);
+    const nextYr = mo === 12 ? yr + 1 : yr;
+    const nextMo = mo === 12 ? '01' : String(mo + 1).padStart(2, '0');
+    const monthStart = `${currentMonth}-01T00:00:00+05:30`;
+    const monthEnd = `${nextYr}-${nextMo}-01T00:00:00+05:30`;
+    const monthStartMs = new Date(monthStart).getTime();
+    const monthEndMs = new Date(monthEnd).getTime();
 
     let grossRevenue = 0;
     let totalOrders = 0;
@@ -2225,51 +2786,123 @@ router.get('/:id/reports', requireRole(['owner', 'admin', 'developer', 'platform
     let taxSgst = 0;
     let discountsGiven = 0;
     let refunds = 0;
+    const seenOrderIds = new Set<string>();
 
-    orderSnap.docs.forEach((d: any) => {
-      const o = d.data() as any;
-      const bId = o.branchId || 'main_branch';
-      const isFranchiseOrder = 
-        o.franchiseId === id || 
-        o.franchiseId === `fra_${id}` || 
-        branchIds.includes(bId) || 
-        (id === 'fra_rajnandgaon' && (!o.franchiseId || o.franchiseId === 'fra_primary' || bId === 'main_branch' || bId === 'branch_rjn'));
+    // 1. Authoritative PostgreSQL aggregation first
+    try {
+      const pgRes = await query(
+        `SELECT id, order_status, order_source, subtotal, discount_amount, tax_amount, cgst, sgst, total_amount, refund_amount
+         FROM canonical_orders
+         WHERE (franchise_id = $1 OR ($1 = 'fra_rajnandgaon' AND (franchise_id = 'fra_primary' OR branch_id IN ('main_branch', 'branch_rjn_main'))))
+           AND created_at >= $2::timestamptz
+           AND created_at < $3::timestamptz`,
+        [id, monthStart, monthEnd]
+      );
+      for (const r of pgRes.rows) {
+        seenOrderIds.add(r.id);
+        const status = String(r.order_status || '').toLowerCase();
+        if (status === 'cancelled' || status === 'rejected') continue;
+        const amt = Number(r.total_amount || 0);
+        grossRevenue += amt;
+        totalOrders += 1;
+        const source = String(r.order_source || '').toLowerCase();
+        if (source === 'pos' || source.startsWith('pos_')) posSales += amt;
+        else onlineSales += amt;
+        const totalTax = Number(r.tax_amount || 0);
+        const halfTax = totalTax / 2;
+        taxCgst += Number(r.cgst ?? halfTax);
+        taxSgst += Number(r.sgst ?? halfTax);
+        discountsGiven += Number(r.discount_amount || 0);
+        if (status === 'refunded' || Number(r.refund_amount || 0) > 0) {
+          refunds += Number(r.refund_amount || amt);
+        }
+      }
+    } catch (pgErr: any) {
+      console.warn('[FranchiseRoutes] PG reports query warning:', pgErr.message);
+    }
 
-      if (!isFranchiseOrder) return;
+    // 2. Bounded Firestore fallback for legacy non-PG order IDs
+    const parseOrderMs = (val: any): number => {
+      if (!val) return NaN;
+      if (typeof val === 'string') return Date.parse(val);
+      if (val.toDate && typeof val.toDate === 'function') return val.toDate().getTime();
+      if (typeof val._seconds === 'number') return val._seconds * 1000;
+      if (typeof val.seconds === 'number') return val.seconds * 1000;
+      if (val instanceof Date) return val.getTime();
+      return NaN;
+    };
 
-      const oDate = parseOrderIso(o.createdAt);
-      if (oDate && (oDate < monthStart || oDate >= monthEnd)) return;
+    try {
+      const [bSnap, orderSnap] = await Promise.all([
+        withTimeout(adminDb.collection('franchises').get(), 'reportsBranches', 1500).catch(() => null),
+        withTimeout(adminDb.collection('orders').where('franchiseId', '==', id).get(), 'reportsOrders', 1500).catch(() => null)
+      ]);
+      const branchIds = bSnap
+        ? bSnap.docs
+            .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+            .filter((b: any) =>
+              b.franchiseId === id ||
+              b.franchiseId === `fra_${id}` ||
+              b.id === id ||
+              b.id === `${id}_branch` ||
+              (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary'))
+            )
+            .map((b: any) => b.id)
+        : [];
+      if (!branchIds.includes(id)) branchIds.push(id);
 
-      const amt = Number(o.totalAmount || 0);
-      const status = (o.status || '').toLowerCase();
-      if (status === 'cancelled' || status === 'rejected') return;
+      if (orderSnap) {
+        orderSnap.docs.forEach((d: any) => {
+          if (seenOrderIds.has(d.id)) return;
+          const o = d.data() as any;
+          const bId = o.branchId || 'main_branch';
+          const isFranchiseOrder =
+            o.franchiseId === id ||
+            o.franchiseId === `fra_${id}` ||
+            branchIds.includes(bId) ||
+            (id === 'fra_rajnandgaon' && (!o.franchiseId || o.franchiseId === 'fra_primary' || bId === 'main_branch' || bId === 'branch_rjn'));
+          if (!isFranchiseOrder) return;
 
-      grossRevenue += amt;
-      totalOrders++;
+          const oMs = parseOrderMs(o.createdAt);
+          if (!Number.isNaN(oMs) && (oMs < monthStartMs || oMs >= monthEndMs)) return;
 
-      const source = (o.orderSource || '').toLowerCase();
-      if (source === 'pos' || source.startsWith('pos_')) posSales += amt;
-      else onlineSales += amt;
+          const amt = Number(o.totalAmount || 0);
+          const status = (o.status || '').toLowerCase();
+          if (status === 'cancelled' || status === 'rejected') return;
 
-      taxCgst += Number(o.cgst || (o.taxAmount ? Number(o.taxAmount || 0) / 2 : 0));
-      taxSgst += Number(o.sgst || (o.taxAmount ? Number(o.taxAmount || 0) / 2 : 0));
-      discountsGiven += Number(o.discountAmount || 0);
-      if (status === 'refunded') refunds += amt;
-    });
+          grossRevenue += amt;
+          totalOrders++;
+
+          const source = (o.orderSource || '').toLowerCase();
+          if (source === 'pos' || source.startsWith('pos_')) posSales += amt;
+          else onlineSales += amt;
+
+          const totalTax = Number(o.taxAmount || 0);
+          taxCgst += Number(o.cgst ?? totalTax / 2);
+          taxSgst += Number(o.sgst ?? totalTax / 2);
+          discountsGiven += Number(o.discountAmount || 0);
+          if (status === 'refunded') refunds += amt;
+        });
+      }
+    } catch { /* Firestore fallback bounded */ }
 
     const netSales = grossRevenue - discountsGiven - refunds;
 
-    // Get Google Sheets status for this franchise
+    // Get Google Sheets status for this franchise (bounded)
     let sheetsStatus: any = { status: 'UNKNOWN' };
     try {
-      sheetsStatus = await FranchiseGoogleSheetsService.getFranchiseSheetsStatus(id) || { status: 'PROVISIONING_PENDING' };
+      sheetsStatus = await withTimeout(FranchiseGoogleSheetsService.getFranchiseSheetsStatus(id), 'reportsSheetsStatus', 1200) || { status: 'PROVISIONING_PENDING' };
     } catch { /* Sheets may not be configured */ }
 
     res.json({
       success: true,
+      currency: 'INR',
+      timezone: 'Asia/Kolkata',
       reports: {
         franchiseId: id,
         currentMonth,
+        currency: 'INR',
+        timezone: 'Asia/Kolkata',
         googleSheetsStatus: {
           status: sheetsStatus.status || 'UNKNOWN',
           workbookName: sheetsStatus.spreadsheetName || `Olive Pizza — ${id.toUpperCase()} — ${currentMonth}`,
@@ -2283,10 +2916,12 @@ router.get('/:id/reports', requireRole(['owner', 'admin', 'developer', 'platform
           totalOrders,
           posSales: Math.round(posSales),
           onlineSales: Math.round(onlineSales),
-          taxCgst: Math.round(taxCgst),
-          taxSgst: Math.round(taxSgst),
+          taxCgst: Number(taxCgst.toFixed(2)),
+          taxSgst: Number(taxSgst.toFixed(2)),
+          totalGst: Number((taxCgst + taxSgst).toFixed(2)),
           discountsGiven: Math.round(discountsGiven),
-          refunds: Math.round(refunds)
+          refunds: Math.round(refunds),
+          currency: 'INR'
         }
       }
     });
@@ -2407,6 +3042,9 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
     if (requestedCode && !/^[A-Z0-9][A-Z0-9_-]{2,19}$/.test(requestedCode)) {
       problems.push('Franchise code must be 3–20 letters, digits, hyphens, or underscores.');
     }
+    if (body.franchiseOwnerGrantPos === true || body.restaurantManagerGrantPos === true) {
+      problems.push('Single-app isolation enabled: a user account can only be granted one operational application at a time.');
+    }
 
     if (problems.length) {
       res.status(400).json({ success: false, code: 'INVALID_FRANCHISE_INPUT', error: problems[0], errors: problems });
@@ -2449,13 +3087,20 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
           res.status(422).json({ success: false, code: 'STAFF_EMAIL_NOT_VERIFIED', error: `Verify ${candidate.email} in Firebase Authentication before assigning franchise access, or leave the account field blank and assign it later.` });
           return;
         }
-        const userSnap = await adminDb.collection('users').doc(authUser.uid).get();
-        const userRecord = userSnap.data() || {};
+        const pgUserRes = await query(
+          `SELECT role FROM app_users WHERE id = $1 OR firebase_uid = $1 OR LOWER(email) = LOWER($2) LIMIT 1`,
+          [authUser.uid, candidate.email]
+        ).catch(() => ({ rows: [] as any[] }));
+        const userSnap = await withTimeout(adminDb.collection('users').doc(authUser.uid).get(), 'provisionUserLookup', 1200).catch(() => null);
+        const userRecord = userSnap?.data?.() || {};
+        const pgRole = String(pgUserRes.rows[0]?.role || '').toLowerCase();
         const currentRole = String(userRecord.role || '').toLowerCase();
         const claimRole = String((authUser.customClaims as Record<string, unknown> | undefined)?.role || '').toLowerCase();
         const protectedRoles = new Set(['owner', 'platform_owner', 'admin', 'developer', 'platform_admin']);
         if (
           authUser.uid === req.user?.uid ||
+          FranchiseScopeService.isGlobalOwner(candidate.email, currentRole || pgRole) ||
+          protectedRoles.has(pgRole) ||
           protectedRoles.has(currentRole) ||
           protectedRoles.has(claimRole) ||
           userRecord.isOwnerMode === true ||
@@ -2480,18 +3125,32 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
     }
 
     // Explicit and generated codes must be unique across canonical franchise and branch records.
-    const [entityCodeSnap, branchCodeSnap] = await Promise.all([
-      adminDb.collection('franchise_entities').where('code', '==', cleanCode).limit(1).get(),
-      adminDb.collection('franchises').where('code', '==', branchCode).limit(1).get()
-    ]);
-    if (!entityCodeSnap.empty || !branchCodeSnap.empty) {
+    const pgConflictRes = await query(
+      `SELECT f.id AS fid, b.id AS bid
+       FROM franchises f
+       FULL OUTER JOIN restaurant_branches b ON b.franchise_id = f.id
+       WHERE f.id = $1 OR b.id = $2 OR (b.metadata->>'code') = $3 OR (b.metadata->>'franchiseCode') = $3
+       LIMIT 1`,
+      [franchiseId, branchId, cleanCode]
+    ).catch(() => ({ rows: [] as any[] }));
+    const [entityCodeSnap, branchCodeSnap] = await withTimeout(
+      Promise.all([
+        adminDb.collection('franchise_entities').where('code', '==', cleanCode).limit(1).get(),
+        adminDb.collection('franchises').where('code', '==', branchCode).limit(1).get()
+      ]),
+      'provisionCodeLookup',
+      1500
+    ).catch(() => [null, null] as any);
+    if (pgConflictRes.rows.length > 0 || (entityCodeSnap && !entityCodeSnap.empty) || (branchCodeSnap && !branchCodeSnap.empty)) {
       res.status(409).json({ success: false, code: 'FRANCHISE_CODE_CONFLICT', error: 'This franchise code is already in use. Choose a different code.' });
       return;
     }
 
     const deliverySettings = {
+      radiusKm: radius,
       maxDeliveryRadiusKm: radius,
       deliveryFee,
+      baseDeliveryFee: deliveryFee,
       freeDeliveryThreshold,
       minOrderAmount
     };
@@ -2582,39 +3241,102 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
     }
     const warnings: string[] = [];
 
-    // All core records are created together. A duplicate ID/race cannot merge over an existing franchise.
-    await adminDb.runTransaction(async (transaction) => {
-      const [entitySnap, branchSnap, settingsSnap] = await Promise.all([
-        transaction.get(entityRef),
-        transaction.get(branchRef),
-        transaction.get(settingsRef)
-      ]);
-      if (entitySnap.exists || branchSnap.exists || settingsSnap.exists) {
+    // Authoritative PostgreSQL commit first (India GST/INR defaults + operational branch metadata).
+    const pgClient = await pgPool.connect();
+    try {
+      await pgClient.query('BEGIN');
+      const existingFr = await pgClient.query('SELECT id FROM franchises WHERE id = $1', [franchiseId]);
+      const existingBr = await pgClient.query('SELECT id FROM restaurant_branches WHERE id = $1', [branchId]);
+      if (existingFr.rows.length > 0 || existingBr.rows.length > 0) {
+        await pgClient.query('ROLLBACK');
         const conflict: any = new Error('A franchise with this ID already exists. Choose a different franchise code.');
         conflict.status = 409;
         conflict.code = 'FRANCHISE_ID_CONFLICT';
         throw conflict;
       }
-      transaction.create(entityRef, franchiseEntity);
-      transaction.create(branchRef, branchData);
-      transaction.create(settingsRef, {
-        branchId,
-        franchiseId,
-        organizationId: orgId,
-        restaurantName: branchData.name,
-        isOpen: acceptingOrders,
-        acceptingOrders,
-        isManualClose: !acceptingOrders,
-        closeReason: acceptingOrders ? '' : 'Pending franchise launch checks',
-        currentPrepTime: 25,
-        operatingHours: dailyHours,
-        services: { delivery: true, takeaway: true, dineIn: true },
-        deliverySettings,
-        createdAt: now,
-        updatedAt: now,
-        createdBy: req.user?.uid
-      });
-    });
+      await pgClient.query(
+        `INSERT INTO franchises (id, name, status, owner_email, created_at, updated_at)
+         VALUES ($1, $2, 'ACTIVE', $3, NOW(), NOW())`,
+        [franchiseId, name, franchiseOwnerEmail || contactEmail || req.user?.email || null]
+      );
+      await pgClient.query(
+        `INSERT INTO restaurant_branches (
+           id, franchise_id, name, address, phone, is_open, accepting_orders, current_prep_time,
+           close_reason, operating_hours, delivery_settings, tax_settings, payment_settings, metadata,
+           latitude, longitude, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 25, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15, NOW(), NOW())`,
+        [
+          branchId,
+          franchiseId,
+          branchData.name,
+          address,
+          phone || '',
+          acceptingOrders,
+          acceptingOrders,
+          branchData.closeReason,
+          JSON.stringify(dailyHours),
+          JSON.stringify(deliverySettings),
+          JSON.stringify({ gstPercentage: 5, packagingCharge: 20 }),
+          JSON.stringify({ upi: true, cards: true, onlineGateway: true, cashOnDelivery: true }),
+          JSON.stringify({
+            code: cleanCode,
+            branchCode,
+            slug,
+            city,
+            state,
+            email: contactEmail || null,
+            organizationId: orgId,
+            posTerminalCount: terminalCount,
+            createdBy: req.user?.uid || 'owner'
+          }),
+          lat,
+          lng
+        ]
+      );
+      await pgClient.query('COMMIT');
+    } catch (pgTxErr) {
+      await pgClient.query('ROLLBACK').catch(() => {});
+      throw pgTxErr;
+    } finally {
+      pgClient.release();
+    }
+
+    // Mirror to Firestore within bounded latency so Firestore contention never blocks PostgreSQL state.
+    try {
+      await withTimeout(adminDb.runTransaction(async (transaction) => {
+        const [entitySnap, branchSnap, settingsSnap] = await Promise.all([
+          transaction.get(entityRef),
+          transaction.get(branchRef),
+          transaction.get(settingsRef)
+        ]);
+        if (entitySnap.exists || branchSnap.exists || settingsSnap.exists) {
+          return;
+        }
+        transaction.create(entityRef, franchiseEntity);
+        transaction.create(branchRef, branchData);
+        transaction.create(settingsRef, {
+          branchId,
+          franchiseId,
+          organizationId: orgId,
+          restaurantName: branchData.name,
+          isOpen: acceptingOrders,
+          acceptingOrders,
+          isManualClose: !acceptingOrders,
+          closeReason: acceptingOrders ? '' : 'Pending franchise launch checks',
+          currentPrepTime: 25,
+          operatingHours: dailyHours,
+          services: { delivery: true, takeaway: true, dineIn: true },
+          deliverySettings,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: req.user?.uid
+        });
+      }), 'provisionFirestoreTx', 2500);
+    } catch (fsTxErr: any) {
+      console.warn('[FranchiseProvision] Firestore mirror warning:', fsTxErr?.message);
+      warnings.push('Franchise saved in PostgreSQL; Firestore realtime sync will catch up automatically.');
+    }
 
     // Staff access is attached to real Firebase UIDs; the platform never invents users from email text.
     for (const account of resolvedAccounts) {
@@ -2625,11 +3347,11 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
           branchId,
           targetRole: account.role,
           applicationAccess: account.role === 'franchise_owner'
-            ? { app_franchise_management: true, app_pos: body.franchiseOwnerGrantPos === true }
-            : { app_restaurant_management: true, app_pos: body.restaurantManagerGrantPos === true },
+            ? { app_franchise_management: true }
+            : { app_restaurant_management: true },
           accountStatus: 'ACTIVE',
           actorUid: req.user?.uid || 'owner',
-          actorEmail: req.user?.email || 'owner@olivepizza.in',
+          actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
           permissions: account.role === 'restaurant_manager'
             ? ['dashboard.view', 'orders.live', 'orders.history', 'inventory.view', 'delivery.view']
             : []
@@ -2662,7 +3384,7 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
           createdBy: req.user?.uid
         });
       }
-      await batch.commit();
+      await withTimeout(batch.commit(), 'provisionPosTerminals', 2000);
     } catch (terminalError: any) {
       console.error('[FranchiseProvision] POS terminal setup failed', { franchiseId, message: terminalError?.message });
       warnings.push('Franchise created, but POS terminal records need to be created from the POS Terminals section before counters can be used.');
@@ -2678,7 +3400,11 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
 
     let sheetsProvisioning: any = { status: 'PROVISIONING_PENDING' };
     try {
-      sheetsProvisioning = await FranchiseGoogleSheetsService.provisionFranchiseSpreadsheet(franchiseId, name, state);
+      sheetsProvisioning = await withTimeout(
+        FranchiseGoogleSheetsService.provisionFranchiseSpreadsheet(franchiseId, name, state),
+        'provisionGoogleSheets',
+        2500
+      );
       if (sheetsProvisioning?.success === false || sheetsProvisioning?.error) {
         warnings.push('Google Sheets setup did not complete. Retry it from the franchise reporting / Sheets controls.');
       }
@@ -2689,12 +3415,12 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
     }
 
     try {
-      await FranchiseScopeService.logFranchiseAudit({
+      await withTimeout(FranchiseScopeService.logFranchiseAudit({
         organizationId: orgId,
         franchiseId,
         branchId,
         actorUid: req.user?.uid || 'owner',
-        actorEmail: req.user?.email || 'owner@olivepizza.in',
+        actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
         actionType: 'FRANCHISE_PROVISIONED',
         entityType: 'franchise_full_provision',
         entityId: franchiseId,
@@ -2702,13 +3428,15 @@ router.post('/provision', requireRole(['owner', 'admin', 'developer', 'platform_
           code: cleanCode,
           branchCode,
           terminalCount,
-          assignedAccounts: resolvedAccounts.map(account => ({ uid: account.uid, role: account.role, apps: account.role === 'franchise_owner'
-            ? ['FRANCHISE_MANAGER', ...(body.franchiseOwnerGrantPos === true ? ['POS'] : [])]
-            : ['RESTAURANT_MANAGER', ...(body.restaurantManagerGrantPos === true ? ['POS'] : [])] })),
+          assignedAccounts: resolvedAccounts.map(account => ({
+            uid: account.uid,
+            role: account.role,
+            apps: account.role === 'franchise_owner' ? ['FRANCHISE_MANAGER'] : ['RESTAURANT_MANAGER']
+          })),
           acceptingOrders,
           warnings
         }
-      });
+      }), 'provisionAudit', 1200);
     } catch (auditError: any) {
       console.error('[FranchiseProvision] Audit write failed after successful core creation:', auditError?.message);
       warnings.push('Franchise was created, but the provisioning audit event could not be saved. Review backend audit storage.');
@@ -2915,32 +3643,29 @@ router.patch('/:id/permissions', requireRole(['owner', 'admin', 'developer', 'pl
 router.get('/:id/access-accounts', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    const scope = FranchiseScopeService.resolveScope(req.user);
+    if (!scope.isGlobalOwner && scope.franchiseId !== id) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
 
-    // 1. Fetch Franchise Owner & Users
-    const uSnap = await adminDb.collection('users').get();
-    const fUsers = uSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(u => u.franchiseId === id || u.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (u.isOwnerMode || u.role === 'owner' || u.email === 'olivepizzarjn@gmail.com' || u.email === 'webhub2811@gmail.com')));
+    // 1. Authoritative PG app_users + delivery_partners query FIRST
+    const [pgUsersRes, pgDpRes, uSnap, mgrSnap, posSnap, riderSnap] = await Promise.all([
+      pgPool.query(
+        `SELECT id, firebase_uid, email, name, phone, role, status, is_active, franchise_id, branch_id, allowed_apps, metadata, updated_at
+         FROM app_users
+         WHERE (franchise_id = $1 OR franchise_id = 'fra_primary' OR ($1 = 'fra_rajnandgaon' AND role IN ('owner', 'platform_owner')))
+           AND LOWER(COALESCE(role, 'customer')) <> 'customer'
+         ORDER BY updated_at DESC`,
+        [id]
+      ).catch(() => ({ rows: [] as any[] })),
+      pgPool.query(`SELECT id, user_id, name, email, phone, status, branch_id, franchise_id, updated_at FROM delivery_partners WHERE franchise_id = $1 OR franchise_id = 'fra_primary'`, [id]).catch(() => ({ rows: [] as any[] })),
+      withTimeout(adminDb.collection('users').get(), 'franchise.accessUsers', 1000).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('restaurant_managers').get(), 'franchise.accessMgrs', 1000).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('pos_accounts').get(), 'franchise.accessPos', 1000).catch(() => ({ docs: [] } as any)),
+      withTimeout(adminDb.collection('delivery_partners').get(), 'franchise.accessRiders', 1000).catch(() => ({ docs: [] } as any))
+    ]);
 
-    // 2. Fetch Restaurant Managers
-    const mgrSnap = await adminDb.collection('restaurant_managers').get();
-    const fManagers = mgrSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(m => m.franchiseId === id || m.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!m.franchiseId || m.branchId === 'main_branch')));
-
-    // 3. Fetch POS Accounts
-    const posSnap = await adminDb.collection('pos_accounts').get();
-    const fPos = posSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(p => p.franchiseId === id || p.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!p.franchiseId || p.branchId === 'main_branch')));
-
-    // 4. Fetch Delivery Partners
-    const riderSnap = await adminDb.collection('delivery_partners').get();
-    const fRiders = riderSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(r => r.franchiseId === id || r.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!r.franchiseId || r.branchId === 'main_branch')));
-
-    // Aggregate accounts with structured application access (deduplicated by email and id)
     const accounts: any[] = [];
     const seenUids = new Set<string>();
     const seenEmails = new Set<string>();
@@ -2954,10 +3679,69 @@ router.get('/:id/access-accounts', requireRole(['owner', 'admin', 'developer', '
       accounts.push(acc);
     };
 
-    // Add Owner / Franchise Managers
-    fUsers.forEach(u => {
+    for (const u of pgUsersRes.rows) {
+      const apps: string[] = Array.isArray(u.allowed_apps) ? u.allowed_apps : [];
+      const isOwner = u.role === 'owner' || u.role === 'platform_owner' || apps.includes('OWNER');
+      addAccountIfUnique({
+        id: u.firebase_uid || u.id,
+        name: u.name || (isOwner ? 'Olive Pizza Owner' : 'Staff Member'),
+        email: u.email,
+        role: u.role,
+        branchId: u.branch_id || 'main_branch',
+        accountStatus: u.is_active === false || ['REVOKED', 'SUSPENDED', 'DISABLED'].includes(String(u.status || '').toUpperCase()) ? 'SUSPENDED' : 'ACTIVE',
+        applicationAccess: {
+          app_franchise_management: !isOwner && apps.includes('FRANCHISE_MANAGER'),
+          app_restaurant_management: !isOwner && apps.includes('RESTAURANT_MANAGER'),
+          app_pos: !isOwner && apps.includes('POS'),
+          app_delivery: !isOwner && apps.includes('DELIVERY'),
+          app_owner: isOwner
+        },
+        permissions: Array.isArray(u.metadata?.permissions) ? u.metadata.permissions : [],
+        updatedAt: u.updated_at instanceof Date ? u.updated_at.toISOString() : u.updated_at
+      });
+    }
+
+    for (const r of pgDpRes.rows) {
+      addAccountIfUnique({
+        id: r.user_id || r.id,
+        name: r.name || 'Delivery Partner',
+        email: r.email,
+        role: 'delivery_partner',
+        branchId: r.branch_id || 'main_branch',
+        accountStatus: ['DISABLED', 'SUSPENDED', 'REVOKED', 'REJECTED'].includes(String(r.status || '').toUpperCase()) ? 'SUSPENDED' : 'ACTIVE',
+        applicationAccess: {
+          app_franchise_management: false,
+          app_restaurant_management: false,
+          app_pos: false,
+          app_delivery: true,
+          app_owner: false
+        },
+        permissions: ['delivery.orders', 'delivery.location'],
+        updatedAt: r.updated_at instanceof Date ? r.updated_at.toISOString() : r.updated_at
+      });
+    }
+
+    const fUsers = (uSnap.docs || [])
+      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      .filter((u: any) => u.franchiseId === id || u.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (u.role === 'owner' || u.email === 'olivepizzarjn@gmail.com' || u.email === 'webhub2811@gmail.com')));
+
+    const fManagers = (mgrSnap.docs || [])
+      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      .filter((m: any) => m.franchiseId === id || m.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!m.franchiseId || m.branchId === 'main_branch')));
+
+    const fPos = (posSnap.docs || [])
+      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      .filter((p: any) => p.franchiseId === id || p.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!p.franchiseId || p.branchId === 'main_branch')));
+
+    const fRiders = (riderSnap.docs || [])
+      .map((d: any) => ({ id: d.id, ...(d.data() as any) }))
+      .filter((r: any) => r.franchiseId === id || r.franchiseId === 'fra_primary' || (id === 'fra_rajnandgaon' && (!r.franchiseId || r.branchId === 'main_branch')));
+
+    // Add Firestore Owner / Staff fallback entries (strictly without granting owner all 4 operational flags)
+    fUsers.forEach((u: any) => {
       const perms = Array.isArray(u.permissions) ? u.permissions : [];
-      const isOwner = u.role === 'owner' || u.isOwnerMode || u.isGlobalOwner || u.admin;
+      const apps = Array.isArray(u.allowedApps) ? u.allowedApps : [];
+      const isOwner = u.role === 'owner' || u.role === 'platform_owner' || apps.includes('OWNER');
       addAccountIfUnique({
         id: u.id,
         name: u.name || u.displayName || (isOwner ? 'Olive Pizza Owner' : 'Staff Member'),
@@ -2966,10 +3750,11 @@ router.get('/:id/access-accounts', requireRole(['owner', 'admin', 'developer', '
         branchId: u.branchId || 'main_branch',
         accountStatus: u.isActive === false || u.status === 'REVOKED' || u.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE',
         applicationAccess: {
-          app_franchise_management: Boolean(u.applicationAccess?.app_franchise_management ?? (isOwner || perms.includes('app_franchise_management') || u.role === 'franchise_manager')),
-          app_restaurant_management: Boolean(u.applicationAccess?.app_restaurant_management ?? (isOwner || perms.includes('app_restaurant_management') || u.role === 'restaurant_manager')),
-          app_pos: Boolean(u.applicationAccess?.app_pos ?? (isOwner || perms.includes('app_pos') || perms.includes('pos.billing') || u.role === 'pos_operator')),
-          app_delivery: Boolean(u.applicationAccess?.app_delivery ?? (isOwner || perms.includes('app_delivery') || u.role === 'delivery_partner'))
+          app_franchise_management: !isOwner && Boolean(u.applicationAccess?.app_franchise_management ?? (apps.includes('FRANCHISE_MANAGER') || perms.includes('app_franchise_management') || u.role === 'franchise_manager')),
+          app_restaurant_management: !isOwner && Boolean(u.applicationAccess?.app_restaurant_management ?? (apps.includes('RESTAURANT_MANAGER') || perms.includes('app_restaurant_management') || u.role === 'restaurant_manager')),
+          app_pos: !isOwner && Boolean(u.applicationAccess?.app_pos ?? (apps.includes('POS') || perms.includes('app_pos') || u.role === 'pos_operator')),
+          app_delivery: !isOwner && Boolean(u.applicationAccess?.app_delivery ?? (apps.includes('DELIVERY') || perms.includes('app_delivery') || u.role === 'delivery_partner')),
+          app_owner: isOwner
         },
         permissions: perms,
         updatedAt: u.updatedAt || new Date().toISOString()
@@ -3067,7 +3852,7 @@ router.post('/:id/access/authorize-account', requireRole(['owner', 'admin', 'dev
       accountStatus: 'ACTIVE',
       permissions: Array.isArray(permissions) ? permissions : ['*'],
       actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in'
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com'
     });
 
     res.json({
@@ -3077,7 +3862,8 @@ router.post('/:id/access/authorize-account', requireRole(['owner', 'admin', 'dev
     });
   } catch (error: any) {
     console.error('[FranchiseRoutes] Error authorizing account:', error);
-    res.status(500).json({ error: error.message || 'Failed to authorize account' });
+    const statusCode = Number(error?.statusCode || error?.status) || 500;
+    res.status(statusCode).json({ error: error.message || 'Failed to authorize account' });
   }
 });
 
@@ -3101,15 +3887,15 @@ router.post('/:id/access/edit', requireRole(['owner', 'admin', 'developer', 'pla
       accountStatus: accountStatus || 'ACTIVE',
       permissions: Array.isArray(permissions) ? permissions : [],
       actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in'
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com'
     });
 
     // Log Server-Authoritative Audit Event
-    await FranchiseScopeService.logFranchiseAudit({
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       franchiseId: id,
       branchId: assignedBranchId,
       actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in',
+      actorEmail: req.user?.email || 'olivepizzarjn@gmail.com',
       actionType: 'ACCESS_PERMISSIONS_CHANGED',
       entityType: targetRole || 'user_account',
       entityId: targetUserId,
@@ -3119,7 +3905,7 @@ router.post('/:id/access/edit', requireRole(['owner', 'admin', 'developer', 'pla
         accountStatus,
         assignedBranchId
       }
-    });
+    }), 'accessEditAudit', 1200).catch(() => {});
 
     res.json({
       success: true,
@@ -3132,7 +3918,8 @@ router.post('/:id/access/edit', requireRole(['owner', 'admin', 'developer', 'pla
     });
   } catch (error: any) {
     console.error('[FranchiseRoutes] Error updating access:', error);
-    res.status(500).json({ error: 'Failed to update access permissions' });
+    const statusCode = Number(error?.statusCode || error?.status) || 500;
+    res.status(statusCode).json({ error: error?.message || 'Failed to update access permissions' });
   }
 });
 
@@ -3423,83 +4210,13 @@ router.get('/pos/all-terminals', requireRole(['owner', 'admin', 'developer', 'pl
   }
 });
 
-// ─── 20. GLOBAL OWNER: SWITCH POS OPERATIONAL CONTEXT (POST /api/pos/owner-context/switch) ───
-router.post('/pos/owner-context/switch', requireRole(['owner', 'admin', 'developer', 'platform_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const { franchiseId, branchId, terminalId, previousContext } = req.body;
-
-    if (!franchiseId || !branchId || !terminalId) {
-      res.status(400).json({ error: 'franchiseId, branchId, and terminalId are required for context switch' });
-      return;
-    }
-
-    // Resolve franchise
-    const fSnap = await adminDb.collection('franchise_entities').doc(franchiseId).get();
-    let franchiseName = fSnap.exists ? (fSnap.data() as any)?.name : `Franchise ${franchiseId}`;
-
-    // Resolve branch
-    const bSnap = await adminDb.collection('franchises').doc(branchId).get();
-    let branchName = bSnap.exists ? (bSnap.data() as any)?.name : `Branch ${branchId}`;
-
-    // Resolve terminal
-    const tSnap = await adminDb.collection('pos_terminals').doc(terminalId).get();
-    const terminalData = tSnap.exists ? (tSnap.data() as any) : {
-      id: terminalId,
-      terminalName: 'POS Billing Terminal',
-      isActive: true,
-      activationStatus: 'ACTIVATED'
-    };
-
-    if (tSnap.exists && terminalData.isActive === false) {
-      res.status(403).json({ error: 'Cannot switch context to a revoked or deactivated POS terminal', code: 'TERMINAL_REVOKED' });
-      return;
-    }
-
-    // Log Server-Authoritative Audit Event
-    await FranchiseScopeService.logFranchiseAudit({
-      franchiseId,
-      branchId,
-      actorUid: req.user?.uid || 'owner',
-      actorEmail: req.user?.email || 'owner@olivepizza.in',
-      actionType: 'OWNER_POS_CONTEXT_SWITCH',
-      entityType: 'pos_terminal_session',
-      entityId: terminalId,
-      details: {
-        previousContext: previousContext || null,
-        newContext: {
-          franchiseId,
-          franchiseName,
-          branchId,
-          branchName,
-          terminalId,
-          terminalName: terminalData.terminalName
-        },
-        timestamp: new Date().toISOString()
-      }
-    });
-
-    res.json({
-      success: true,
-      message: `Owner POS context switched to ${franchiseName} ➔ ${branchName} ➔ ${terminalData.terminalName}`,
-      session: {
-        isOwnerMode: true,
-        cashierName: `👑 Owner (${req.user?.email?.split('@')[0] || 'Master'})`,
-        cashierUid: req.user?.uid || 'owner_global',
-        role: 'owner',
-        terminalId,
-        terminalName: terminalData.terminalName || 'POS Terminal',
-        branchId,
-        branchName,
-        franchiseId,
-        franchiseName,
-        organizationId: 'org_olive_pizza',
-        sessionStartedAt: new Date().toISOString()
-      }
-    });
-  } catch (error: any) {
-    console.error('[FranchiseRoutes] Error switching owner POS context:', error);
-    res.status(500).json({ error: 'Failed to switch owner POS context' });
-  }
+// ─── 20. GLOBAL OWNER: SWITCH POS OPERATIONAL CONTEXT (DISABLED BY LEAST-PRIVILEGE POLICY) ───
+router.post('/pos/owner-context/switch', requireRole(['owner', 'admin', 'developer', 'platform_owner']), async (_req: AuthRequest, res: Response): Promise<void> => {
+  res.status(403).json({
+    success: false,
+    code: 'CROSS_APP_CONTEXT_SWITCH_DISABLED',
+    error: 'Owner cross-franchise switching into POS/management apps is disabled. View each franchise inside its dedicated Owner Portal section.'
+  });
 });
 
 
@@ -3507,53 +4224,83 @@ router.post('/pos/owner-context/switch', requireRole(['owner', 'admin', 'develop
 router.get('/:id/telemetry', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    const scope = FranchiseScopeService.resolveScope(req.user);
+    if (!scope.isGlobalOwner && scope.franchiseId !== id) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
 
-    // Resolve franchise name from Firestore
-    const fDoc = await adminDb.collection('franchise_entities').doc(id).get();
-    const franchiseName = fDoc.exists ? (fDoc.data() as any)?.name : id;
+    const fRes = await pgPool.query(`SELECT name FROM franchises WHERE id = $1 LIMIT 1`, [id]).catch(() => ({ rows: [] as any[] }));
+    const fDoc = fRes.rows.length === 0 ? await withTimeout(adminDb.collection('franchise_entities').doc(id).get(), 'franchise.telemetryName', 1200).catch(() => null) : null;
+    const franchiseName = fRes.rows[0]?.name || (fDoc?.exists ? (fDoc.data() as any)?.name : id);
 
-    // Real order metrics
-    const orderSnap = await adminDb.collection('orders').limit(200).get().catch(() => ({ docs: [] } as any));
     let todaySales = 0, todayOrders = 0, activeOrders = 0, completedOrders = 0;
     let posSales = 0, onlineSales = 0;
-    const today = new Date().toISOString().slice(0, 10);
-    orderSnap.docs.forEach((d: any) => {
-      const o = d.data();
-      if (o.franchiseId && o.franchiseId !== id) return;
-      const oDate = (o.createdAt || '').slice(0, 10);
-      if (oDate !== today) return;
-      const status = (o.status || '').toLowerCase();
-      if (status !== 'cancelled' && status !== 'rejected') {
-        const amount = Number(o.totalAmount || 0);
-        todaySales += amount;
-        todayOrders++;
-        if (o.source === 'POS' || o.orderSource === 'POS' || o.posTerminalId) {
-          posSales += amount;
-        } else {
-          onlineSales += amount;
-        }
-      }
-      if (['pending','accepted','preparing','ready','out_for_delivery'].includes(status)) activeOrders++;
-      else if (['delivered','completed'].includes(status)) completedOrders++;
-    });
+    const today = getIstDateKey();
 
-    const posSnap = await adminDb.collection('pos_terminals').get().catch(() => ({ docs: [] } as any));
+    const pgOrdRes = await pgPool.query(
+      `SELECT id, LOWER(order_status) AS status, total_amount, order_source,
+              to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS ist_date
+       FROM canonical_orders WHERE franchise_id = $1 ORDER BY created_at DESC LIMIT 200`,
+      [id]
+    ).catch(() => ({ rows: [] as any[] }));
+
+    const seenIds = new Set<string>();
+    for (const row of pgOrdRes.rows) {
+      seenIds.add(row.id);
+      const status = row.status || '';
+      const amt = Number(row.total_amount || 0);
+      const isPos = (row.order_source || '').toUpperCase().startsWith('POS');
+      if (row.ist_date === today && status !== 'cancelled' && status !== 'rejected') {
+        todayOrders++;
+        todaySales += amt;
+        if (isPos) posSales += amt; else onlineSales += amt;
+      }
+      if (['pending', 'accepted', 'preparing', 'ready', 'partner_assigned', 'picked_up', 'out_for_delivery'].includes(status)) activeOrders++;
+      if (['delivered', 'completed'].includes(status)) completedOrders++;
+    }
+
+    const orderSnap = await withTimeout(adminDb.collection('orders').where('franchiseId', '==', id).limit(200).get(), 'franchise.telemetryOrders', 1200).catch(() => ({ docs: [] } as any));
+    orderSnap.docs.forEach((d: any) => {
+      if (seenIds.has(d.id)) return;
+      const o = d.data();
+      const status = (o.status || '').toLowerCase();
+      const amt = Number(o.totalAmount || 0);
+      const isPos = o.orderSource === 'POS' || o.source === 'pos';
+      const createdIso = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt || Date.now());
+      const createdIst = !isNaN(createdIso.getTime()) ? getIstDateKey(createdIso) : '';
+      if (createdIst === today && status !== 'cancelled' && status !== 'rejected') {
+        todayOrders++;
+        todaySales += amt;
+        if (isPos) posSales += amt; else onlineSales += amt;
+      }
+      if (['pending', 'accepted', 'preparing', 'ready', 'partner_assigned', 'picked_up', 'out_for_delivery'].includes(status)) activeOrders++;
+      if (['delivered', 'completed'].includes(status)) completedOrders++;
+    });
+    const posSnap = await withTimeout(adminDb.collection('pos_terminals').get(), 'franchise.telemetryPos', 1200).catch(() => ({ docs: [] } as any));
     const activeTerminals = posSnap.docs.filter((d: any) => {
       const t = d.data();
       return (t.franchiseId === id) && t.isActive !== false;
-    }).length;
+    }).length || 1;
 
-    const riderSnap = await adminDb.collection('delivery_partners').get().catch(() => ({ docs: [] } as any));
-    const activeRiders = riderSnap.docs.filter((d: any) => {
-      const r = d.data();
-      return (r.franchiseId === id) && r.isActive !== false && r.isOnline === true;
-    }).length;
+    const pgRidersRes = await pgPool.query(
+      `SELECT COUNT(*)::int AS cnt FROM delivery_partners WHERE franchise_id = $1 AND status = 'APPROVED' AND is_online = true`,
+      [id]
+    ).catch(() => ({ rows: [{ cnt: 0 }] }));
+    let activeRiders = Number(pgRidersRes.rows[0]?.cnt || 0);
+    if (activeRiders === 0) {
+      const riderSnap = await withTimeout(adminDb.collection('delivery_partners').get(), 'franchise.telemetryRiders', 1200).catch(() => ({ docs: [] } as any));
+      activeRiders = riderSnap.docs.filter((d: any) => {
+        const r = d.data();
+        return (r.franchiseId === id) && r.isActive !== false && r.isOnline === true;
+      }).length;
+    }
 
     res.json({
       success: true,
       franchiseId: id,
       franchise: { id, name: franchiseName },
-      telemetry: { todaySales, todayOrders, activeOrders, completedOrders, posSales, onlineSales, activeTerminals, activeRiders }
+      telemetry: { todaySales, todayOrders, activeOrders, completedOrders, posSales, onlineSales, activeTerminals, activeRiders, currency: 'INR' }
     });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
@@ -3564,10 +4311,29 @@ router.get('/:id/telemetry', requireRole(['owner', 'admin', 'developer', 'platfo
 router.get('/:id/restaurants', requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const bSnap = await adminDb.collection('franchises').get();
-    const branches = bSnap.docs
-      .map(d => ({ id: d.id, ...(d.data() as any) }))
-      .filter(b => b.franchiseId === id || (id === 'fra_rajnandgaon' && (b.id === 'main_branch' || b.franchiseId === 'fra_primary')));
+    const scope = FranchiseScopeService.resolveScope(req.user);
+    if (!scope.isGlobalOwner && scope.franchiseId !== id) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+
+    let branches: any[] = [];
+    const pgBranchesRes = await pgPool.query(
+      `SELECT id, franchise_id AS "franchiseId", name, address, phone, is_open AS "isOpen",
+              accepting_orders AS "acceptingOrders", current_prep_time AS "currentPrepTime",
+              operating_hours AS "operatingHours", delivery_settings AS "deliverySettings",
+              latitude, longitude, created_at AS "createdAt"
+       FROM restaurant_branches
+       WHERE franchise_id = $1
+       ORDER BY created_at ASC`,
+      [id]
+    ).catch(() => ({ rows: [] as any[] }));
+    branches = pgBranchesRes.rows;
+
+    if (branches.length === 0) {
+      const bSnap = await withTimeout(adminDb.collection('franchises').where('franchiseId', '==', id).get(), 'franchise.aliasRestaurants', 1200).catch(() => ({ docs: [] } as any));
+      branches = bSnap.docs.map((d: any) => ({ id: d.id, ...(d.data() as any) }));
+    }
 
     res.json({
       success: true,
@@ -3594,20 +4360,56 @@ router.get('/:id/live-orders', requireRole(['owner', 'admin', 'developer', 'plat
       return;
     }
 
-    const orderSnap = await adminDb.collection('orders')
-      .where('franchiseId', '==', id)
-      .limit(100)
-      .get()
-      .catch(async () => {
-        return await adminDb.collection('orders').limit(100).get();
-      });
+    let orders: any[] = [];
+    const seenIds = new Set<string>();
+    try {
+      const pgOrdRes = await pgPool.query(
+        `SELECT o.*,
+                COALESCE(json_agg(json_build_object(
+                  'id', i.product_id, 'productId', i.product_id, 'name', i.product_name,
+                  'quantity', i.quantity, 'price', i.unit_price, 'total', i.total_price
+                )) FILTER (WHERE i.id IS NOT NULL), '[]'::json) AS items
+         FROM canonical_orders o
+         LEFT JOIN canonical_order_items i ON o.id = i.order_id
+         WHERE o.franchise_id = $1
+         GROUP BY o.id
+         ORDER BY o.created_at DESC
+         LIMIT 100`,
+        [id]
+      );
+      for (const row of pgOrdRes.rows) {
+        seenIds.add(row.id);
+        orders.push(OrderProjectionService.projectForFranchiseManager({
+          ...row,
+          id: row.id,
+          franchiseId: row.franchise_id,
+          branchId: row.branch_id,
+          status: (row.order_status || 'pending').toLowerCase(),
+          totalAmount: Number(row.total_amount || 0),
+          customerName: row.customer_name,
+          customerPhone: row.customer_phone,
+          createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+          updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at
+        }, row.id));
+      }
+    } catch (pgErr: any) {
+      console.warn('[FranchiseRoutes] PG /:id/live-orders notice:', pgErr.message);
+    }
 
-    const orders = orderSnap.docs
-      .filter(d => {
-        const data = d.data();
-        return !data.franchiseId || data.franchiseId === id || id === 'fra_primary' || id === 'fra_rajnandgaon';
-      })
-      .map(d => OrderProjectionService.projectForFranchiseManager(d.data(), d.id));
+    const orderSnap = await withTimeout(
+      adminDb.collection('orders').where('franchiseId', '==', id).limit(100).get(),
+      'franchise.liveOrdersRead',
+      1500
+    ).catch(() => ({ docs: [] } as any));
+
+    for (const d of (orderSnap.docs || [])) {
+      if (seenIds.has(d.id)) continue;
+      const data = d.data();
+      if (data.franchiseId === id) {
+        seenIds.add(d.id);
+        orders.push(OrderProjectionService.projectForFranchiseManager(data, d.id));
+      }
+    }
 
     res.json({
       success: true,

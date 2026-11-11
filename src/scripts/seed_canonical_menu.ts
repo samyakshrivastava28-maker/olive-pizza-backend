@@ -293,7 +293,53 @@ export async function seedCanonicalMenu(): Promise<void> {
   }
   console.log(`✅ Seeded ${coupons.length} canonical coupons into PostgreSQL.`);
 
-  // 4. Invalidate Redis menu bootstrap caches
+  // 4. Authoritative Restaurant Branches
+  const branches = [
+    {
+      id: 'main_branch',
+      franchise_id: 'fra_rajnandgaon',
+      name: 'Olive Pizza (Rajnandgaon HQ)',
+      address: 'Shop 12, Station Road, Rajnandgaon, Chhattisgarh 491441',
+      phone: '9826199887',
+      latitude: 21.0974,
+      longitude: 81.0347,
+      radiusKm: 25
+    },
+    {
+      id: 'branch_bsp_main',
+      franchise_id: 'fra_bilaspur',
+      name: 'Bilaspur Main Branch',
+      address: 'Vyapar Vihar, Bilaspur, Chhattisgarh 495001',
+      phone: '9179944447',
+      latitude: 22.0797,
+      longitude: 82.1409,
+      radiusKm: 25
+    }
+  ];
+
+  for (const b of branches) {
+    await query(`
+      INSERT INTO restaurant_branches (
+        id, franchise_id, name, address, phone, latitude, longitude,
+        is_open, accepting_orders, delivery_settings
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, $8)
+      ON CONFLICT (id) DO UPDATE SET
+        franchise_id = EXCLUDED.franchise_id,
+        name = EXCLUDED.name,
+        latitude = EXCLUDED.latitude,
+        longitude = EXCLUDED.longitude,
+        is_open = true,
+        accepting_orders = true,
+        delivery_settings = EXCLUDED.delivery_settings;
+    `, [
+      b.id, b.franchise_id, b.name, b.address, b.phone, b.latitude, b.longitude,
+      JSON.stringify({ radiusKm: b.radiusKm })
+    ]);
+  }
+  console.log(`✅ Seeded ${branches.length} authoritative branches with GPS & delivery radii into PostgreSQL.`);
+
+  // 5. Invalidate Redis menu bootstrap caches
   try {
     await redisService.invalidateMenu();
     console.log('✅ Invalidation of Redis menu bootstrap cache completed.');

@@ -1,9 +1,9 @@
 import { adminDb } from '../../config/firebase.js';
+import { withTimeout } from '../../lib/utils.js';
 import { pgPool } from '../../config/postgres.js';
 import { randomUUID } from 'crypto';
 import { PreparationTimeEngine } from './PreparationTimeEngine.js';
 import { RiderDispatchEngine } from '../delivery/RiderDispatchEngine.js';
-import { StoreBoundDeliveryFleetService } from '../delivery/StoreBoundDeliveryFleetService.js';
 import { notificationEngine } from '../notification/NotificationEngine.js';
 import { OwnerTemplates, CustomerTemplates, RestaurantTemplates, DeliveryTemplates } from '../notification/NotificationTemplates.js';
 import { LoyaltyService } from '../loyalty/LoyaltyService.js';
@@ -54,7 +54,7 @@ export interface TransitionResult {
 // Canonical transition matrix
 const ALLOWED_TRANSITIONS: Record<CanonicalOrderStatus, CanonicalOrderStatus[]> = {
   pending:          ['accepted', 'preparing', 'cancelled'],
-  accepted:         ['preparing', 'cancelled'],
+  accepted:         ['preparing', 'ready', 'cancelled'],
   preparing:        ['partner_assigned', 'ready', 'picked_up', 'delivered', 'cancelled'],
   partner_assigned: ['ready', 'picked_up', 'out_for_delivery', 'delivered', 'cancelled'],
   ready:            ['partner_assigned', 'picked_up', 'out_for_delivery', 'delivered', 'cancelled'],
@@ -72,6 +72,7 @@ const ROLE_AUTHORITY: Record<string, StateMachineActorRole[]> = {
   'pending->preparing':         ['restaurant_manager', 'kitchen_staff', 'cashier', 'system'],
   'pending->cancelled':         ['customer', 'restaurant_manager', 'cashier', 'system'],
   'accepted->preparing':        ['restaurant_manager', 'kitchen_staff', 'cashier', 'system'],
+  'accepted->ready':            ['restaurant_manager', 'kitchen_staff', 'cashier', 'system'],
   'accepted->cancelled':        ['restaurant_manager', 'cashier', 'system'],
   'preparing->partner_assigned': ['restaurant_manager', 'cashier', 'system'],
   'preparing->ready':           ['restaurant_manager', 'kitchen_staff', 'cashier', 'system'],
@@ -136,7 +137,7 @@ export class OrderStateMachine {
     const normalizedActorRole = normalizeStateMachineRole(actor.role);
 
 
-    const client = await pgPool.connect().catch(() => null);
+    let client = await pgPool.connect().catch(() => null);
     
     try {
       if (client) {
@@ -149,24 +150,70 @@ export class OrderStateMachine {
 
       // Rule BR-05: PostgreSQL is the sole authoritative source of truth for order statuses
       let orderData: any = null;
-      try {
-        const { OrderPersistenceArchiveService } = await import('./OrderPersistenceArchiveService.js');
-        orderData = await OrderPersistenceArchiveService.getHistoricalOrder(orderId);
-      } catch (pgErr: any) {
-        console.warn(`[OrderStateMachine] PostgreSQL canonical read notice for ${orderId}:`, pgErr.message);
+      if (client) {
+        try {
+          const pgRes = await client.query(
+            `SELECT * FROM canonical_orders WHERE id = $1 LIMIT 1`,
+            [orderId]
+          );
+          if (pgRes.rows.length > 0) {
+            const row = pgRes.rows[0];
+            orderData = {
+              id: row.id,
+              status: (row.order_status || 'PENDING').toLowerCase(),
+              order_status: row.order_status,
+              branchId: row.branch_id,
+              franchiseId: row.franchise_id,
+              deliveryPartnerId: row.delivery_partner_id,
+              deliveryPartnerName: row.delivery_partner_name,
+              deliveryPartnerPhone: row.delivery_partner_phone,
+              customerName: row.customer_name,
+              customerPhone: row.customer_phone,
+              contactPhone: row.customer_phone,
+              totalAmount: Number(row.total_amount || 0),
+              paymentMethod: row.payment_method,
+              paymentStatus: row.payment_status,
+              orderType: row.order_type,
+              fulfillmentType: row.order_type,
+              deliveryType: row.order_type,
+              deliveryAddress: typeof row.delivery_address === 'string' && row.delivery_address.startsWith('{')
+                ? JSON.parse(row.delivery_address)
+                : (typeof row.delivery_address === 'object' && row.delivery_address !== null ? row.delivery_address : { addressLine: row.delivery_address }),
+              location: (row.metadata && row.metadata.location) || null,
+              customerLocation: (row.metadata && (row.metadata.customerLocation || row.metadata.location)) || null,
+              deliveryLocation: (row.metadata && (row.metadata.deliveryLocation || row.metadata.location)) || null,
+              isPaid: row.payment_status === 'PAID' || row.payment_status === 'COLLECTED',
+              expectedReadyAt: row.expected_ready_at,
+              estimatedPreparationMinutes: row.estimated_preparation_minutes,
+              dailyOrderNumber: row.daily_order_no,
+              permanentBillNo: row.permanent_bill_no,
+              notification_version: Number(row.version || 1)
+            };
+          }
+        } catch (pgErr: any) {
+          console.warn(`[OrderStateMachine] PostgreSQL direct canonical read notice for ${orderId}:`, pgErr.message);
+        }
+      }
+
+      if (!orderData) {
+        try {
+          const { OrderPersistenceArchiveService } = await import('./OrderPersistenceArchiveService.js');
+          orderData = await OrderPersistenceArchiveService.getHistoricalOrder(orderId);
+        } catch (pgErr: any) {
+          console.warn(`[OrderStateMachine] PostgreSQL canonical read notice for ${orderId}:`, pgErr.message);
+        }
       }
 
       const orderRef = adminDb.collection('orders').doc(orderId);
-      try {
-        const docSnap = await orderRef.get();
-        if (docSnap.exists) {
-          const fsData = docSnap.data()!;
-          orderData = orderData 
-            ? { ...fsData, ...orderData, status: orderData.status || fsData.status }
-            : fsData;
+      if (!orderData) {
+        try {
+          const docSnap = await withTimeout(orderRef.get(), 'stateMachineOrderRead', 1500);
+          if (docSnap && docSnap.exists) {
+            orderData = docSnap.data()!;
+          }
+        } catch (fsErr: any) {
+          console.warn(`[OrderStateMachine] Firestore read notice for ${orderId}:`, fsErr.message);
         }
-      } catch (fsErr: any) {
-        console.warn(`[OrderStateMachine] Firestore read notice for ${orderId}:`, fsErr.message);
       }
 
       if (!orderData) {
@@ -185,10 +232,14 @@ export class OrderStateMachine {
 
       if (fromState === toState) {
         if (metadata && Object.keys(metadata).length > 0) {
-          await orderRef.set({
-            ...metadata,
-            updatedAt: new Date()
-          }, { merge: true }).catch(() => {});
+          await withTimeout(
+            orderRef.set({
+              ...metadata,
+              updatedAt: new Date()
+            }, { merge: true }),
+            'stateMachineSameStateMerge',
+            1200
+          ).catch(() => {});
         }
         if (client) await client.query('COMMIT').catch(() => {});
         return {
@@ -322,7 +373,12 @@ export class OrderStateMachine {
           };
         }
 
-        if (orderBranch && staffBranch !== 'all' && staffBranch !== orderBranch) {
+        const isSameBranch = 
+          staffBranch === 'all' || 
+          staffBranch === orderBranch ||
+          ((staffBranch === 'main_branch' || staffBranch === 'branch_rjn_main') && (orderBranch === 'main_branch' || orderBranch === 'branch_rjn_main'));
+
+        if (orderBranch && !isSameBranch) {
           if (client) await client.query('ROLLBACK').catch(() => {});
           return {
             success: false,
@@ -339,20 +395,36 @@ export class OrderStateMachine {
         const assignedRiderId = orderData.deliveryPartnerId || orderData.riderId;
         // If order already has an assigned rider, only that rider can perform rider transitions
         if (assignedRiderId && actor.uid !== assignedRiderId) {
-          if (client) await client.query('ROLLBACK').catch(() => {});
-          return {
-            success: false,
-            orderId,
-            previousStatus: fromState,
-            currentStatus: fromState,
-            version: orderData.notification_version || 1,
-            error: `Delivery partner '${actor.uid}' is not assigned to order '${orderId}' (assigned: '${assignedRiderId}').`,
-          };
+          let isAssignedPartner = false;
+          try {
+            const { query } = await import('../../lib/db.js');
+            const dpRes = await query(
+              'SELECT id, user_id FROM delivery_partners WHERE (id = $1 OR user_id = $1) AND (user_id = $2 OR id = $2) LIMIT 1',
+              [assignedRiderId, actor.uid]
+            );
+            if (dpRes.rows.length > 0) {
+              isAssignedPartner = true;
+            }
+          } catch (e: any) {
+            console.warn('[OrderStateMachine] Rider identity resolution error:', e.message);
+          }
+
+          if (!isAssignedPartner) {
+            if (client) await client.query('ROLLBACK').catch(() => {});
+            return {
+              success: false,
+              orderId,
+              previousStatus: fromState,
+              currentStatus: fromState,
+              version: orderData.notification_version || 1,
+              error: `Delivery partner '${actor.uid}' is not assigned to order '${orderId}' (assigned: '${assignedRiderId}').`,
+            };
+          }
         }
       }
 
       // Explicit fulfillment validation: Takeaway / Dine-in vs Delivery
-      const fulfillment = (orderData.orderType || orderData.fulfillmentType || orderData.orderSource || '').toLowerCase();
+      const fulfillment = (orderData.deliveryType || orderData.orderType || orderData.fulfillmentType || orderData.orderSource || '').toLowerCase();
       const isDeliveryOrder = fulfillment.includes('delivery');
 
       if (isDeliveryOrder && ['ready', 'preparing'].includes(fromState) && toState === 'delivered') {
@@ -439,14 +511,18 @@ export class OrderStateMachine {
 
         case 'ready': {
           updates.readyAt = nowIso;
-          // If this is a delivery order without an assigned partner yet, auto-dispatch immediately using Store FIFO Queue
+          // Auto-dispatch via authoritative PostgreSQL RiderDispatchEngine (queues cleanly into PendingDispatchQueueService when busy)
           const fulfillment = (orderData.fulfillmentType || orderData.deliveryType || 'delivery').toLowerCase();
           if (fulfillment === 'delivery' && !orderData.deliveryPartnerId && !metadata.deliveryPartnerId) {
             const branchId = orderData.branchId;
             if (branchId) {
-              StoreBoundDeliveryFleetService.assignOrderToFifoRider(orderId, branchId).catch((e) =>
-                console.warn('[OrderStateMachine] Store FIFO dispatch on ready notice:', e.message)
-              );
+              setImmediate(async () => {
+                try {
+                  await RiderDispatchEngine.autoDispatchRider(orderId);
+                } catch (e: any) {
+                  console.warn('[OrderStateMachine] Auto-dispatch on ready notice:', e.message);
+                }
+              });
             }
           }
           break;
@@ -502,8 +578,12 @@ export class OrderStateMachine {
           const paymentMethod = (orderData.paymentMethod || '').toLowerCase();
           const isCod = paymentMethod === 'cod' || orderData.isCod === true;
           if (isCod) {
-            const pStatus = (orderData.paymentStatus || '').toUpperCase();
-            const isPaid = orderData.isPaid === true || pStatus === 'PAID' || pStatus === 'COLLECTED';
+            let isPaid = orderData.isPaid === true || ['PAID', 'COLLECTED'].includes((orderData.paymentStatus || '').toUpperCase());
+            if (!isPaid && (metadata.paymentCollected === true || metadata.paymentStatus === 'PAID' || metadata.paymentStatus === 'COLLECTED')) {
+              isPaid = true;
+              updates.paymentStatus = 'PAID';
+              updates.paymentCollectedAt = nowIso;
+            }
             if (!isPaid) {
               if (client) await client.query('ROLLBACK').catch(() => {});
               return {
@@ -518,11 +598,21 @@ export class OrderStateMachine {
           }
 
           updates.deliveredAt = nowIso;
-          // Release rider active order lock
+          // Release rider active order lock in PostgreSQL and Firestore
           const riderId = orderData.deliveryPartnerId || metadata.deliveryPartnerId;
           if (riderId) {
             adminDb.collection('users').doc(riderId).set({ activeOrderId: null }, { merge: true }).catch(() => {});
             adminDb.collection('delivery_partners').doc(riderId).set({ activeOrderId: null }, { merge: true }).catch(() => {});
+            if (client) {
+              await client.query(
+                `UPDATE delivery_partners
+                 SET active_order_id = NULL,
+                     total_deliveries = COALESCE(total_deliveries, 0) + 1,
+                     updated_at = NOW()
+                 WHERE id = $1 OR user_id = $1`,
+                [riderId]
+              ).catch(() => {});
+            }
           }
 
           // Single Source of Truth: Schedule Supabase GPS cleanup 5 minutes after delivery completion
@@ -548,11 +638,20 @@ export class OrderStateMachine {
           updates.cancellationAcknowledged = false;
           updates.cancellationAcknowledgedAt = null;
 
-          // Release rider active order lock if assigned
+          // Release rider active order lock if assigned in PostgreSQL and Firestore
           const riderId = orderData.deliveryPartnerId || metadata.deliveryPartnerId;
           if (riderId) {
             adminDb.collection('users').doc(riderId).set({ activeOrderId: null }, { merge: true }).catch(() => {});
             adminDb.collection('delivery_partners').doc(riderId).set({ activeOrderId: null }, { merge: true }).catch(() => {});
+            if (client) {
+              await client.query(
+                `UPDATE delivery_partners
+                 SET active_order_id = NULL,
+                     updated_at = NOW()
+                 WHERE id = $1 OR user_id = $1 OR active_order_id = $2`,
+                [riderId, orderId]
+              ).catch(() => {});
+            }
           }
 
           // Authoritative payment/refund status
@@ -571,59 +670,47 @@ export class OrderStateMachine {
           break;
       }
 
-      try {
-        await orderRef.set(updates, { merge: true });
-      } catch (fsWriteErr: any) {
-        console.warn(`[OrderStateMachine] Firestore write notice for ${orderId}:`, fsWriteErr.message);
-      }
-
-      // Audit log entry
-      adminDb.collection('order_audit_logs').add({
-        orderId,
-        previousStatus: fromState,
-        currentStatus: toState,
-        actorUid: actor.uid,
-        actorRole: actor.role,
-        actorName: actor.name || 'Staff',
-        branchId: orderData.branchId || null,
-        timestamp: nowIso,
-        metadata,
-      }).catch(() => {});
-
-      // Notification Scoped Dispatch (Section 9)
-      this.dispatchScopedNotifications(orderId, fromState, toState, { ...orderData, ...updates });
-
-      // Google Sheets sync on delivered
-      if (toState === 'delivered') {
-        import('../reports/GoogleSheetsReportService.js').then(({ GoogleSheetsReportService }) => {
-          GoogleSheetsReportService.appendOrderToMonthlySheet({
-            orderId,
-            customerName: orderData.customerName || 'Customer',
-            customerPhone: orderData.contactPhone || 'N/A',
-            totalAmount: orderData.totalAmount || 0,
-            paymentMethod: orderData.paymentMethod || 'COD',
-            orderType: orderData.deliveryType || 'delivery',
-            status: 'delivered',
-            itemCount: (orderData.items || []).length,
-            couponCode: orderData.appliedCouponCode,
-            deliveryTimeMins: orderData.estimatedPreparationMinutes || 20,
-            timestamp: nowIso,
-          }).catch((e) => console.warn('[GoogleSheets] Append warning:', e.message));
-        }).catch(() => {});
-      }
-
       if (client) {
         // Authoritative canonical PostgreSQL order status update
-        const updateRes: any = await client.query(`
-          UPDATE canonical_orders
-          SET order_status = $1,
-              updated_at = NOW()
-              ${toState === 'cancelled' ? ', cancellation_reason = $3, cancelled_at = NOW()' : ''}
-          WHERE id = $2;
-        `, toState === 'cancelled' ? [toState.toUpperCase(), orderId, metadata.cancellationReason || 'CANCELLED'] : [toState.toUpperCase(), orderId]).catch((err: any) => {
-          console.warn('[OrderStateMachine] PostgreSQL status sync notice:', err?.message);
-          return { rowCount: 0 };
-        });
+        const updateRes: any = toState === 'cancelled'
+          ? await client.query(`
+              UPDATE canonical_orders
+              SET order_status = $1::varchar,
+                  cancellation_reason = $3,
+                  cancelled_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, ['CANCELLED', orderId, metadata.cancellationReason || 'CANCELLED']).catch((err: any) => {
+              console.warn('[OrderStateMachine] PostgreSQL cancellation sync notice:', err?.message);
+              return { rowCount: 0 };
+            })
+          : await client.query(`
+              UPDATE canonical_orders
+              SET order_status = $1::varchar,
+                  accepted_at = COALESCE(accepted_at, CASE WHEN $1::varchar IN ('ACCEPTED','PREPARING','PARTNER_ASSIGNED','READY','PICKED_UP','OUT_FOR_DELIVERY','DELIVERED') THEN NOW() ELSE NULL END),
+                  preparation_started_at = COALESCE(preparation_started_at, CASE WHEN $1::varchar IN ('PREPARING','PARTNER_ASSIGNED','READY','PICKED_UP','OUT_FOR_DELIVERY','DELIVERED') THEN NOW() ELSE NULL END),
+                  ready_at = COALESCE(ready_at, CASE WHEN $1::varchar IN ('READY','PICKED_UP','OUT_FOR_DELIVERY','DELIVERED') THEN NOW() ELSE NULL END),
+                  delivered_at = COALESCE(delivered_at, CASE WHEN $1::varchar = 'DELIVERED' THEN NOW() ELSE NULL END),
+                  partner_assigned_at = COALESCE(partner_assigned_at, CASE WHEN $1::varchar IN ('PARTNER_ASSIGNED','PICKED_UP','OUT_FOR_DELIVERY','DELIVERED') THEN NOW() ELSE NULL END),
+                  delivery_partner_id = COALESCE($5, delivery_partner_id),
+                  delivery_partner_name = COALESCE($6, delivery_partner_name),
+                  delivery_partner_phone = COALESCE($7, delivery_partner_phone),
+                  estimated_preparation_minutes = COALESCE($3::integer, estimated_preparation_minutes),
+                  expected_ready_at = COALESCE($4::timestamptz, expected_ready_at),
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, [
+              toState.toUpperCase(),
+              orderId,
+              updates.estimatedPreparationMinutes != null ? Number(updates.estimatedPreparationMinutes) : null,
+              updates.expectedReadyAt || null,
+              updates.deliveryPartnerId || metadata.deliveryPartnerId || null,
+              updates.deliveryPartnerName || metadata.deliveryPartnerName || null,
+              updates.deliveryPartnerPhone || metadata.deliveryPartnerPhone || null
+            ]).catch((err: any) => {
+              console.warn('[OrderStateMachine] PostgreSQL status sync notice:', err?.message);
+              return { rowCount: 0 };
+            });
 
         // Self-healing: If row was not present in canonical_orders, insert it immediately
         if (updateRes && updateRes.rowCount === 0 && orderData) {
@@ -679,6 +766,50 @@ export class OrderStateMachine {
         }
 
         await client.query('COMMIT').catch(() => {});
+        await client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
+        client.release();
+        client = null;
+      }
+
+      // ASYNCHRONOUS EXTERNAL WAN & DOWNSTREAM PROJECTIONS
+      // Executed strictly AFTER PostgreSQL transaction commit and client release to avoid WAN-induced latency / DB pool starvation
+      orderRef.set(updates, { merge: true }).catch((fsWriteErr: any) => {
+        console.warn(`[OrderStateMachine] Firestore write notice for ${orderId}:`, fsWriteErr.message);
+      });
+
+      // Audit log entry
+      adminDb.collection('order_audit_logs').add({
+        orderId,
+        previousStatus: fromState,
+        currentStatus: toState,
+        actorUid: actor.uid,
+        actorRole: actor.role,
+        actorName: actor.name || 'Staff',
+        branchId: orderData.branchId || null,
+        timestamp: nowIso,
+        metadata,
+      }).catch(() => {});
+
+      // Notification Scoped Dispatch (Section 9)
+      this.dispatchScopedNotifications(orderId, fromState, toState, { ...orderData, ...updates });
+
+      // Google Sheets sync on delivered
+      if (toState === 'delivered') {
+        import('../reports/GoogleSheetsReportService.js').then(({ GoogleSheetsReportService }) => {
+          GoogleSheetsReportService.appendOrderToMonthlySheet({
+            orderId,
+            customerName: orderData.customerName || 'Customer',
+            customerPhone: orderData.contactPhone || 'N/A',
+            totalAmount: orderData.totalAmount || 0,
+            paymentMethod: orderData.paymentMethod || 'COD',
+            orderType: orderData.deliveryType || 'delivery',
+            status: 'delivered',
+            itemCount: (orderData.items || []).length,
+            couponCode: orderData.appliedCouponCode,
+            deliveryTimeMins: orderData.estimatedPreparationMinutes || 20,
+            timestamp: nowIso,
+          }).catch((e) => console.warn('[GoogleSheets] Append warning:', e.message));
+        }).catch(() => {});
       }
 
       // Terminal Order Finalization: Record statutory bill in PostgreSQL and mark completed in Firestore (no destructive purge)
@@ -714,8 +845,9 @@ export class OrderStateMachine {
       };
     } finally {
       if (client) {
-        client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
+        await client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
         client.release();
+        client = null;
       }
     }
   }

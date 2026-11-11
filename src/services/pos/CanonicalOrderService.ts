@@ -951,7 +951,7 @@ export class CanonicalOrderService {
         ) AS items
       FROM canonical_orders o
       LEFT JOIN canonical_order_items i ON o.id = i.order_id
-      WHERE (o.branch_id = $1 OR o.franchise_id = $1 OR $1 = 'main_branch' OR $1 = '' OR $1 IS NULL)
+      WHERE (o.branch_id = $1 OR o.franchise_id = $1 OR ($1 IN ('main_branch', 'branch_rjn_main') AND o.branch_id IN ('main_branch', 'branch_rjn_main')))
         AND o.order_source IN ('ONLINE', 'CUSTOMER_APP', 'ONLINE_APP')
         AND o.order_date >= ($2::date - INTERVAL '1 day')
         AND o.order_status IN ('PLACED', 'pending_acceptance', 'ACCEPTED', 'PREPARING', 'READY', 'READY_FOR_PICKUP')

@@ -127,14 +127,8 @@ export class OrderPersistenceArchiveService {
       const totalAmount = Number(orderData.totalAmount || orderData.finalTotal || (subtotal - discountAmount + taxAmount + deliveryFee + packagingCharge));
 
       // Robust franchise and branch resolution: support snake_case and infer primary franchise for legacy orders
-      const franchiseId = orderData.franchiseId || orderData.franchise_id || (orderData.branchId ? 'fra_primary' : null);
-      if (!franchiseId) {
-        throw new Error(`[OrderPersistence] Refusing sync/archive: missing required franchiseId for order ${orderId}`);
-      }
-      const branchId = orderData.branchId || orderData.branch_id || (franchiseId ? 'main_branch' : null);
-      if (!branchId) {
-        throw new Error(`[OrderPersistence] Refusing sync/archive: missing required branchId for order ${orderId}`);
-      }
+      const franchiseId = orderData.franchiseId || orderData.franchise_id || 'fra_rajnandgaon';
+      const branchId = orderData.branchId || orderData.branch_id || 'branch_rjn_main';
       const cashierName = orderData.cashierName || (orderSource.startsWith('POS') ? 'Cashier' : 'Online App');
       const terminalId = orderData.terminalId || (orderSource.startsWith('POS') ? 'POS-TERM-01' : 'ONLINE-APP');
       const notes = orderData.notes || orderData.deliveryInstructions || '';
@@ -142,7 +136,13 @@ export class OrderPersistenceArchiveService {
       // Determine or allocate permanent bill number & daily order number
       let permanentBillNo: number = Number(orderData.permanentBillNo || 0);
       let dailyOrderNo: number = Number(orderData.dailyOrderNumber || 0);
-      let orderDate: string = orderData.orderDateLocal || BillingNumberService.getLocalDateString();
+      let rawOrderDate = orderData.orderDateLocal || orderData.orderDate || BillingNumberService.getLocalDateString();
+      if (typeof rawOrderDate === 'object' && rawOrderDate !== null) {
+        if (rawOrderDate._seconds) rawOrderDate = new Date(rawOrderDate._seconds * 1000).toISOString().slice(0, 10);
+        else if (rawOrderDate.toDate) rawOrderDate = rawOrderDate.toDate().toISOString().slice(0, 10);
+        else rawOrderDate = BillingNumberService.getLocalDateString();
+      }
+      let orderDate: string = String(rawOrderDate).slice(0, 10);
       let orderTime: string = BillingNumberService.getLocalTimeString();
 
       if (!permanentBillNo || permanentBillNo <= 0) {
@@ -186,6 +186,9 @@ export class OrderPersistenceArchiveService {
         }
 
         // 1. Upsert canonical order
+        const estPrepMins = orderData.estimatedPreparationMinutes != null ? Number(orderData.estimatedPreparationMinutes) : null;
+        const expReadyAt = orderData.expectedReadyAt || orderData.estimatedReadyAt || null;
+
         await client.query(`
           INSERT INTO canonical_orders (
             id, permanent_bill_no, daily_order_no, order_date, order_time,
@@ -193,14 +196,16 @@ export class OrderPersistenceArchiveService {
             customer_name, customer_phone, delivery_address, table_number,
             subtotal, discount_amount, coupon_code, tax_amount, cgst, sgst,
             delivery_fee, total_amount, franchise_id, branch_id, cashier_id,
-            cashier_name, terminal_id, notes, customer_id, delivered_at, live_lifecycle
+            cashier_name, terminal_id, notes, customer_id, delivered_at, live_lifecycle,
+            estimated_preparation_minutes, expected_ready_at
           ) VALUES (
             $1, $2, $3, $4::date, $5::time,
             $6, $7, $8, $9, $10,
             $11, $12, $13, $14,
             $15, $16, $17, $18, $19, $20,
             $21, $22, $23, $24, $25,
-            $26, $27, $28, $29, $30, $31
+            $26, $27, $28, $29, $30, $31,
+            $32, $33
           ) ON CONFLICT (id) DO UPDATE SET
             order_status = EXCLUDED.order_status,
             payment_status = EXCLUDED.payment_status,
@@ -209,6 +214,8 @@ export class OrderPersistenceArchiveService {
             customer_id = COALESCE(EXCLUDED.customer_id, canonical_orders.customer_id),
             delivered_at = COALESCE(EXCLUDED.delivered_at, canonical_orders.delivered_at),
             live_lifecycle = EXCLUDED.live_lifecycle,
+            estimated_preparation_minutes = COALESCE(EXCLUDED.estimated_preparation_minutes, canonical_orders.estimated_preparation_minutes),
+            expected_ready_at = COALESCE(EXCLUDED.expected_ready_at, canonical_orders.expected_ready_at),
             updated_at = NOW();
         `, [
           orderId, permanentBillNo, dailyOrderNo, orderDate, orderTime,
@@ -218,7 +225,9 @@ export class OrderPersistenceArchiveService {
           deliveryFee, totalAmount, franchiseId, branchId, orderData.cashierId || null,
           orderData.cashierName || null, orderData.terminalId || null, orderData.notes || null, orderData.customerId || orderData.userId || null,
           (rawStatus.toLowerCase() === 'delivered' || pgOrderStatus === 'DELIVERED') ? new Date() : null,
-          (rawStatus.toLowerCase() === 'delivered' || rawStatus.toLowerCase() === 'cancelled' || pgOrderStatus === 'DELIVERED' || pgOrderStatus === 'CANCELLED') ? 'TERMINAL' : (orderData.live_lifecycle || 'ACTIVE')
+          (rawStatus.toLowerCase() === 'delivered' || rawStatus.toLowerCase() === 'cancelled' || pgOrderStatus === 'DELIVERED' || pgOrderStatus === 'CANCELLED') ? 'TERMINAL' : (orderData.live_lifecycle || 'ACTIVE'),
+          estPrepMins,
+          expReadyAt
         ]);
 
         // 2. Insert or upsert line items deterministically
@@ -637,8 +646,15 @@ export class OrderPersistenceArchiveService {
           o.delivery_partner_name,
           o.delivery_partner_phone,
           o.partner_assigned_at,
+          o.accepted_at,
+          o.preparation_started_at,
+          o.ready_at,
+          o.estimated_preparation_minutes,
+          o.expected_ready_at,
           o.delivered_at,
           o.created_at,
+          o.updated_at,
+          rb.name AS branch_name,
           COALESCE(
             json_agg(
               json_build_object(
@@ -649,6 +665,7 @@ export class OrderPersistenceArchiveService {
                 'crust', i.crust,
                 'quantity', i.quantity,
                 'unitPrice', i.unit_price,
+                'price', i.unit_price,
                 'lineTotal', i.line_total,
                 'addons', i.addons_json
               )
@@ -656,15 +673,17 @@ export class OrderPersistenceArchiveService {
             '[]'::json
           ) AS items
         FROM canonical_orders o
+        LEFT JOIN restaurant_branches rb ON rb.id = o.branch_id
         LEFT JOIN canonical_order_items i ON o.id = i.order_id
         WHERE o.id = $1
-        GROUP BY o.id;
+        GROUP BY o.id, rb.name;
       `;
 
       const res = await query(sql, [orderId]);
       if (res.rows.length === 0) return null;
 
       const r = res.rows[0];
+      const statusLower = (r.order_status || 'pending').toLowerCase();
       return {
         id: r.id,
         orderId: r.id,
@@ -679,7 +698,7 @@ export class OrderPersistenceArchiveService {
         orderSource: r.order_source,
         deliveryType: r.order_type,
         orderType: r.order_type,
-        status: (r.order_status || 'delivered').toLowerCase(),
+        status: statusLower,
         orderStatus: r.order_status,
         paymentMethod: r.payment_method,
         paymentStatus: r.payment_status,
@@ -699,7 +718,7 @@ export class OrderPersistenceArchiveService {
         totalAmount: parseFloat(r.total_amount),
         franchiseId: r.franchise_id,
         branchId: r.branch_id,
-        branchName: 'Olive Pizza — Rajnandgaon HQ',
+        branchName: r.branch_name || 'Olive Pizza',
         cashierName: r.cashier_name,
         terminalId: r.terminal_id,
         cancellationReason: r.cancellation_reason,
@@ -708,9 +727,17 @@ export class OrderPersistenceArchiveService {
         deliveryPartnerName: r.delivery_partner_name || null,
         deliveryPartnerPhone: r.delivery_partner_phone || null,
         partnerAssignedAt: r.partner_assigned_at || null,
+        acceptedAt: r.accepted_at || null,
+        preparationStartedAt: r.preparation_started_at || null,
+        readyAt: r.ready_at || null,
+        estimatedPreparationMinutes: r.estimated_preparation_minutes != null ? Number(r.estimated_preparation_minutes) : null,
+        prepTimeMinutes: r.estimated_preparation_minutes != null ? Number(r.estimated_preparation_minutes) : null,
+        expectedReadyAt: r.expected_ready_at || null,
+        estimatedReadyAt: r.expected_ready_at || null,
         deliveredAt: r.delivered_at,
         createdAt: r.created_at,
-        isArchived: true,
+        updatedAt: r.updated_at || r.created_at,
+        isArchived: ['delivered', 'cancelled'].includes(statusLower),
         items: r.items
       };
     } catch (err: any) {
@@ -749,8 +776,16 @@ export class OrderPersistenceArchiveService {
           o.tax_amount,
           o.delivery_fee,
           o.total_amount,
+          o.franchise_id,
           o.branch_id,
+          rb.name AS branch_name,
+          o.delivery_partner_id,
+          o.delivery_partner_name,
+          o.delivery_partner_phone,
+          o.estimated_preparation_minutes,
+          o.expected_ready_at,
           o.created_at,
+          o.updated_at,
           COALESCE(
             json_agg(
               json_build_object(
@@ -758,49 +793,62 @@ export class OrderPersistenceArchiveService {
                 'size', i.size_variant,
                 'quantity', i.quantity,
                 'unitPrice', i.unit_price,
+                'price', i.unit_price,
                 'lineTotal', i.line_total
               )
             ) FILTER (WHERE i.id IS NOT NULL),
             '[]'::json
           ) AS items
         FROM canonical_orders o
+        LEFT JOIN restaurant_branches rb ON rb.id = o.branch_id
         LEFT JOIN canonical_order_items i ON o.id = i.order_id
         WHERE (o.customer_id = $1 OR ($2::text IS NOT NULL AND $2::text != 'N/A' AND o.customer_phone = $2::text))
-        GROUP BY o.id
+        GROUP BY o.id, rb.name
         ORDER BY o.permanent_bill_no DESC
         LIMIT $3;
       `;
 
       const res = await query(sql, [userId, customerPhone || null, limit]);
-      return res.rows.map(r => ({
-        id: r.id,
-        orderId: r.id,
-        userId,
-        customerId: userId,
-        permanentBillNo: parseInt(r.permanent_bill_no, 10),
-        billNumber: `#${r.permanent_bill_no}`,
-        dailyOrderNumber: parseInt(r.daily_order_no, 10),
-        orderNumber: `#${r.daily_order_no}`,
-        orderDateLocal: r.order_date,
-        deliveryType: r.order_type,
-        orderType: r.order_type,
-        status: (r.order_status || 'delivered').toLowerCase(),
-        orderStatus: r.order_status,
-        paymentMethod: r.payment_method,
-        paymentStatus: r.payment_status,
-        customerName: r.customer_name,
-        contactPhone: r.customer_phone,
-        deliveryAddress: typeof r.delivery_address === 'string' ? { addressLine: r.delivery_address } : r.delivery_address,
-        subtotal: parseFloat(r.subtotal),
-        discountAmount: parseFloat(r.discount_amount),
-        taxes: parseFloat(r.tax_amount),
-        deliveryFee: parseFloat(r.delivery_fee),
-        totalAmount: parseFloat(r.total_amount),
-        branchId: r.branch_id,
-        createdAt: r.created_at,
-        isArchived: true,
-        items: r.items
-      }));
+      return res.rows.map(r => {
+        const statusLower = (r.order_status || 'pending').toLowerCase();
+        return {
+          id: r.id,
+          orderId: r.id,
+          userId,
+          customerId: userId,
+          permanentBillNo: parseInt(r.permanent_bill_no, 10),
+          billNumber: `#${r.permanent_bill_no}`,
+          dailyOrderNumber: parseInt(r.daily_order_no, 10),
+          orderNumber: `#${r.daily_order_no}`,
+          orderDateLocal: r.order_date,
+          deliveryType: r.order_type,
+          orderType: r.order_type,
+          status: statusLower,
+          orderStatus: r.order_status,
+          paymentMethod: r.payment_method,
+          paymentStatus: r.payment_status,
+          customerName: r.customer_name,
+          contactPhone: r.customer_phone,
+          deliveryAddress: typeof r.delivery_address === 'string' ? { addressLine: r.delivery_address } : r.delivery_address,
+          subtotal: parseFloat(r.subtotal),
+          discountAmount: parseFloat(r.discount_amount),
+          taxes: parseFloat(r.tax_amount),
+          deliveryFee: parseFloat(r.delivery_fee),
+          totalAmount: parseFloat(r.total_amount),
+          franchiseId: r.franchise_id,
+          branchId: r.branch_id,
+          branchName: r.branch_name || 'Olive Pizza',
+          deliveryPartnerId: r.delivery_partner_id || null,
+          deliveryPartnerName: r.delivery_partner_name || null,
+          deliveryPartnerPhone: r.delivery_partner_phone || null,
+          estimatedPreparationMinutes: r.estimated_preparation_minutes != null ? Number(r.estimated_preparation_minutes) : null,
+          expectedReadyAt: r.expected_ready_at || null,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at || r.created_at,
+          isArchived: ['delivered', 'cancelled'].includes(statusLower),
+          items: r.items
+        };
+      });
     } catch (err: any) {
       console.warn(`[OrderPersistence] Error fetching customer historical orders:`, err.message);
       return [];

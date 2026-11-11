@@ -1,4 +1,4 @@
-﻿import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import { adminAuth, adminDb } from '../config/firebase.js';
 import { query } from '../config/postgres.js';
 import { FranchiseScopeService, ScopeContext } from '../services/franchise/FranchiseScopeService.js';
@@ -124,8 +124,8 @@ export const verifyToken = async (req: AuthRequest, res: Response, next: NextFun
         [uid]
       );
 
-      // 2. By Email (if not found by UID)
-      if (pgUserRes.rows.length === 0 && emailLower) {
+      // 2. By Email (if not found by UID) - strictly require verified email to prevent unverified account takeover
+      if (pgUserRes.rows.length === 0 && emailLower && decodedToken.email_verified === true) {
         pgUserRes = await query(
           `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata
            FROM app_users 
@@ -684,9 +684,42 @@ export const optionalAuth = async (req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.split('Bearer ')[1]?.trim();
 
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
+    let decodedToken: any;
+    try {
+      decodedToken = await adminAuth.verifyIdToken(token, true);
+    } catch (err: any) {
+      if (err.code === 'auth/id-token-revoked' || err.message?.includes('revoked')) {
+        res.status(403).json({ error: 'Forbidden: Account has been revoked', code: 'ACCOUNT_REVOKED' });
+        return;
+      }
+      decodedToken = await adminAuth.verifyIdToken(token, false);
+    }
+
+    if (decodedToken.role === 'REVOKED' || decodedToken.status === 'REVOKED') {
+      res.status(403).json({ error: 'Forbidden: Account has been revoked', code: 'ACCOUNT_REVOKED' });
+      return;
+    }
+
     const uid = decodedToken.uid;
-    const role = (decodedToken.role as string) || 'customer';
+    let role = (decodedToken.role as string) || 'customer';
+    const emailLower = decodedToken.email ? decodedToken.email.toLowerCase().trim() : '';
+
+    try {
+      const pgRes = await query(
+        `SELECT role, status, is_active FROM app_users WHERE id = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2)) LIMIT 1`,
+        [uid, emailLower]
+      );
+      if (pgRes.rows.length > 0) {
+        const u = pgRes.rows[0];
+        if (u.is_active === false || ['REVOKED', 'SUSPENDED', 'DISABLED', 'REJECTED'].includes(u.status)) {
+          res.status(403).json({ error: 'Forbidden: Account has been deactivated or revoked', code: 'ACCOUNT_REVOKED' });
+          return;
+        }
+        if (u.role && u.role !== 'customer') role = u.role;
+      }
+    } catch {
+      // Optional auth proceeds with Firebase claims if PG check is transiently unavailable
+    }
 
     req.user = {
       uid,

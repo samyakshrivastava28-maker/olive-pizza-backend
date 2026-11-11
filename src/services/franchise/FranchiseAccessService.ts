@@ -1,6 +1,7 @@
 import { adminDb, adminAuth } from '../../config/firebase.js';
 import { FranchiseScopeService } from './FranchiseScopeService.js';
 import { query } from '../../config/postgres.js';
+import { withTimeout } from '../../lib/utils.js';
 
 
 export interface FranchiseAccessEntry {
@@ -91,37 +92,47 @@ export class FranchiseAccessService {
     if (!adminDb) throw new Error('Database service unavailable');
 
     // 1. Resolve user email and UID
-    let userDocRef = adminDb.collection('users').doc(targetUserId);
-    let userDocSnap = await userDocRef.get();
-    let email = '';
+    let email = targetUserId.includes('@') ? targetUserId.toLowerCase().trim() : '';
     let targetUid = targetUserId;
 
+    const pgLookup = await query(
+      `SELECT id, firebase_uid, email, name, phone, role, branch_id, franchise_id, metadata
+       FROM app_users
+       WHERE id = $1 OR firebase_uid = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2))
+       LIMIT 1`,
+      [targetUserId, email]
+    ).catch(() => ({ rows: [] as any[] }));
+    const pgExisting = pgLookup.rows[0] || null;
+    if (pgExisting?.email && !email) email = String(pgExisting.email).toLowerCase().trim();
+    if (pgExisting?.firebase_uid && targetUserId.includes('@')) targetUid = pgExisting.firebase_uid;
+
+    let userDocRef = adminDb.collection('users').doc(targetUid);
+    let userDocSnap: any = await withTimeout(userDocRef.get(), 'access.userDocRead', 1200).catch(() => ({ exists: false, data: () => ({}) }));
+
     if (userDocSnap.exists) {
-      email = (userDocSnap.data()?.email || '').toLowerCase().trim();
+      email = (userDocSnap.data()?.email || email || '').toLowerCase().trim();
     } else {
-      // Check if targetUserId is an email or from subcollection
       if (targetUserId.includes('@')) {
         email = targetUserId.toLowerCase().trim();
-        const q = await adminDb.collection('users').where('email', '==', email).limit(1).get();
+        const q = await withTimeout(adminDb.collection('users').where('email', '==', email).limit(1).get(), 'access.userEmailRead', 1200).catch(() => ({ empty: true, docs: [] }));
         if (!q.empty) {
           userDocRef = adminDb.collection('users').doc(q.docs[0].id);
           userDocSnap = q.docs[0];
           targetUid = q.docs[0].id;
         } else if (adminAuth) {
-          const authUser = await adminAuth.getUserByEmail(email).catch(() => null);
+          const authUser = await withTimeout(adminAuth.getUserByEmail(email), 'access.authByEmail', 1200).catch(() => null);
           if (authUser) {
             targetUid = authUser.uid;
             userDocRef = adminDb.collection('users').doc(targetUid);
-            userDocSnap = await userDocRef.get();
+            userDocSnap = await withTimeout(userDocRef.get(), 'access.authUserDocRead', 1200).catch(() => ({ exists: false, data: () => ({}) }));
           }
         }
       } else {
-        // Try looking up in restaurant_managers, pos_accounts, or franchise_users
-        const rmDoc = await adminDb.collection('restaurant_managers').doc(targetUserId).get();
+        const rmDoc = await withTimeout(adminDb.collection('restaurant_managers').doc(targetUserId).get(), 'access.rmRead', 1000).catch(() => ({ exists: false, data: () => ({}) }));
         if (rmDoc.exists && rmDoc.data()?.email) {
           email = (rmDoc.data()?.email || '').toLowerCase().trim();
         } else {
-          const posDoc = await adminDb.collection('pos_accounts').doc(targetUserId).get();
+          const posDoc = await withTimeout(adminDb.collection('pos_accounts').doc(targetUserId).get(), 'access.posRead', 1000).catch(() => ({ exists: false, data: () => ({}) }));
           if (posDoc.exists && posDoc.data()?.email) {
             email = (posDoc.data()?.email || '').toLowerCase().trim();
           }
@@ -129,20 +140,18 @@ export class FranchiseAccessService {
       }
     }
 
-    // If still no user doc, look up via Firebase Auth
-    if (!email && adminAuth && !targetUserId.includes('@')) {
-      const authUser = await adminAuth.getUser(targetUserId).catch(() => null);
+    if (!email && adminAuth && !targetUid.includes('@')) {
+      const authUser = await withTimeout(adminAuth.getUser(targetUid), 'access.authByUid', 1200).catch(() => null);
       if (authUser?.email) {
         email = authUser.email.toLowerCase().trim();
       }
     }
 
-    // If user doc exists, ensure email is captured
     if (userDocSnap.exists && !email && userDocSnap.data()?.email) {
       email = (userDocSnap.data()?.email || '').toLowerCase().trim();
     }
 
-    let effectiveBranchId = branchId || (userDocSnap.exists ? userDocSnap.data()?.branchId : undefined);
+    let effectiveBranchId = branchId || pgExisting?.branch_id || (userDocSnap.exists ? userDocSnap.data()?.branchId : undefined);
     if (!effectiveBranchId) {
       if (franchiseId === 'fra_rajnandgaon' || franchiseId === 'fra_primary') {
         effectiveBranchId = 'main_branch';
@@ -151,27 +160,131 @@ export class FranchiseAccessService {
       }
     }
 
+    const isOwnerRole = targetRole === 'owner' || targetRole === 'platform_owner';
     const accessEntry: FranchiseAccessEntry = {
       franchiseId,
       branchId: effectiveBranchId,
       role: targetRole,
-      applications: {
-        restaurantManagement: Boolean(applicationAccess.app_restaurant_management),
-        franchiseManagement: Boolean(applicationAccess.app_franchise_management),
-        pos: Boolean(applicationAccess.app_pos),
-        delivery: Boolean(applicationAccess.app_delivery)
-      },
+      applications: isOwnerRole
+        ? { restaurantManagement: false, franchiseManagement: false, pos: false, delivery: false }
+        : {
+            restaurantManagement: Boolean(applicationAccess.app_restaurant_management),
+            franchiseManagement: Boolean(applicationAccess.app_franchise_management),
+            pos: Boolean(applicationAccess.app_pos),
+            delivery: Boolean(applicationAccess.app_delivery)
+          },
       status: accountStatus,
       updatedAt: now
     };
 
     const allowedApps: string[] = [];
-    if (accessEntry.applications.franchiseManagement) allowedApps.push('FRANCHISE_MANAGER');
-    if (accessEntry.applications.restaurantManagement) allowedApps.push('RESTAURANT_MANAGER');
-    if (accessEntry.applications.pos) allowedApps.push('POS');
-    if (accessEntry.applications.delivery) allowedApps.push('DELIVERY');
+    if (isOwnerRole) {
+      allowedApps.push('OWNER');
+    } else {
+      if (accessEntry.applications.franchiseManagement) allowedApps.push('FRANCHISE_MANAGER');
+      if (accessEntry.applications.restaurantManagement) allowedApps.push('RESTAURANT_MANAGER');
+      if (accessEntry.applications.pos) allowedApps.push('POS');
+      if (accessEntry.applications.delivery) allowedApps.push('DELIVERY');
+    }
 
-    // 2. Update canonical users document
+    if (!isOwnerRole && accountStatus === 'ACTIVE' && allowedApps.length > 1) {
+      const err: any = new Error(
+        `Single-app isolation violation: an account cannot hold multiple operational applications simultaneously (${allowedApps.join(', ')}).`
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // 1. Authoritative PostgreSQL persistence FIRST (resilient even when Firestore quota is exhausted)
+    const allowedAppsJson = JSON.stringify(allowedApps);
+    const existingMeta = (pgExisting?.metadata && typeof pgExisting.metadata === 'object') ? { ...pgExisting.metadata } : {};
+    if (accessEntry.applications.pos && accountStatus === 'ACTIVE') {
+      const termList = Array.isArray(existingMeta.allowed_terminals) && existingMeta.allowed_terminals.length > 0
+        ? existingMeta.allowed_terminals
+        : [ (userDocSnap.exists ? userDocSnap.data()?.terminalId : null) || 'POS-01' ];
+      existingMeta.allowed_terminals = termList;
+      existingMeta.terminalId = termList[0];
+    }
+
+    await query(
+      `INSERT INTO app_users (id, firebase_uid, email, name, phone, role, status, franchise_id, branch_id, allowed_apps, metadata, is_active, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         firebase_uid = COALESCE(EXCLUDED.firebase_uid, app_users.firebase_uid),
+         email = COALESCE(EXCLUDED.email, app_users.email),
+         name = COALESCE(EXCLUDED.name, app_users.name),
+         phone = COALESCE(EXCLUDED.phone, app_users.phone),
+         role = EXCLUDED.role,
+         status = EXCLUDED.status,
+         franchise_id = EXCLUDED.franchise_id,
+         branch_id = EXCLUDED.branch_id,
+         allowed_apps = EXCLUDED.allowed_apps,
+         metadata = EXCLUDED.metadata,
+         is_active = EXCLUDED.is_active,
+         updated_at = NOW()`,
+      [
+        targetUid,
+        targetUid && !targetUid.includes('@') ? targetUid : null,
+        email || null,
+        pgExisting?.name || (userDocSnap.exists ? (userDocSnap.data()?.name || userDocSnap.data()?.displayName) : null) || (email ? email.split('@')[0] : 'Staff User'),
+        pgExisting?.phone || (userDocSnap.exists ? (userDocSnap.data()?.phone || userDocSnap.data()?.phoneNumber) : null) || null,
+        targetRole,
+        accountStatus === 'ACTIVE' ? 'APPROVED' : 'DISABLED',
+        franchiseId,
+        effectiveBranchId,
+        allowedAppsJson,
+        JSON.stringify(existingMeta),
+        accountStatus === 'ACTIVE'
+      ]
+    );
+    if (email) {
+      await query(
+        `UPDATE app_users
+         SET role = $2, status = $3, franchise_id = $4, branch_id = $5, allowed_apps = $6::jsonb, metadata = COALESCE(metadata, '{}'::jsonb) || $7::jsonb, is_active = $8, updated_at = NOW()
+         WHERE email IS NOT NULL AND LOWER(email) = LOWER($1) AND id <> $9`,
+        [
+          email,
+          targetRole,
+          accountStatus === 'ACTIVE' ? 'APPROVED' : 'DISABLED',
+          franchiseId,
+          effectiveBranchId,
+          allowedAppsJson,
+          JSON.stringify(existingMeta),
+          accountStatus === 'ACTIVE',
+          targetUid
+        ]
+      ).catch(() => {});
+    }
+
+    if (accessEntry.applications.delivery && accountStatus === 'ACTIVE') {
+      await query(
+        `INSERT INTO delivery_partners (id, user_id, name, email, phone, status, is_online, branch_id, franchise_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'APPROVED', true, $6, $7, NOW())
+         ON CONFLICT (id) DO UPDATE SET
+           user_id = COALESCE(EXCLUDED.user_id, delivery_partners.user_id),
+           email = COALESCE(EXCLUDED.email, delivery_partners.email),
+           status = 'APPROVED',
+           branch_id = EXCLUDED.branch_id,
+           franchise_id = EXCLUDED.franchise_id,
+           updated_at = NOW()`,
+        [
+          targetUid,
+          targetUid && !targetUid.includes('@') ? targetUid : null,
+          pgExisting?.name || (userDocSnap.exists ? (userDocSnap.data()?.name || userDocSnap.data()?.displayName) : null) || 'Delivery Partner',
+          email || null,
+          pgExisting?.phone || (userDocSnap.exists ? (userDocSnap.data()?.phone || userDocSnap.data()?.phoneNumber) : null) || null,
+          effectiveBranchId,
+          franchiseId
+        ]
+      ).catch((dpPgErr: any) => console.warn('[FranchiseAccessService] delivery_partners sync notice:', dpPgErr.message));
+    } else {
+      await query(
+        `UPDATE delivery_partners SET status = 'DISABLED', is_online = false, updated_at = NOW() WHERE id = $1 OR user_id = $1`,
+        [targetUid]
+      ).catch(() => {});
+    }
+
+    // 2. Best-effort Firestore synchronization (bounded timeouts)
     const existingFranchiseAccess: FranchiseAccessEntry[] = (userDocSnap.exists && Array.isArray(userDocSnap.data()?.franchiseAccess))
       ? userDocSnap.data()?.franchiseAccess
       : [];
@@ -213,12 +326,12 @@ export class FranchiseAccessService {
       userUpdates.isActive = false;
     }
 
-    await userDocRef.set(userUpdates, { merge: true });
+    await withTimeout(userDocRef.set(userUpdates, { merge: true }), 'access.userDocWrite', 1200).catch(() => {});
 
-    // 3. Synchronize to restaurant_managers collection
+    // 3. Synchronize operational collections (bounded)
     const rmDocRef = adminDb.collection('restaurant_managers').doc(targetUid);
     if (accessEntry.applications.restaurantManagement && accountStatus === 'ACTIVE') {
-      await rmDocRef.set({
+      await withTimeout(rmDocRef.set({
         id: targetUid,
         email,
         role: 'restaurant_manager',
@@ -228,19 +341,19 @@ export class FranchiseAccessService {
         isActive: true,
         permissions: permissions.length > 0 ? permissions : ['dashboard.view', 'orders.live', 'orders.history', 'inventory.view', 'notifications.send', 'delivery.view'],
         updatedAt: now
-      }, { merge: true });
+      }, { merge: true }), 'access.rmWrite', 1000).catch(() => {});
     } else {
-      await rmDocRef.set({
+      await withTimeout(rmDocRef.set({
         isActive: false,
         status: accountStatus === 'ACTIVE' ? 'REVOKED' : accountStatus,
         updatedAt: now
-      }, { merge: true }).catch(() => {});
+      }, { merge: true }), 'access.rmRevokeWrite', 1000).catch(() => {});
     }
 
     // 4. Synchronize to pos_accounts collection
     const posDocRef = adminDb.collection('pos_accounts').doc(targetUid);
     if (accessEntry.applications.pos && accountStatus === 'ACTIVE') {
-      await posDocRef.set({
+      await withTimeout(posDocRef.set({
         id: targetUid,
         email,
         franchiseId,
@@ -248,19 +361,19 @@ export class FranchiseAccessService {
         status: 'APPROVED',
         isActive: true,
         updatedAt: now
-      }, { merge: true });
+      }, { merge: true }), 'access.posWrite', 1000).catch(() => {});
     } else {
-      await posDocRef.set({
+      await withTimeout(posDocRef.set({
         isActive: false,
         status: 'REVOKED',
         updatedAt: now
-      }, { merge: true }).catch(() => {});
+      }, { merge: true }), 'access.posRevokeWrite', 1000).catch(() => {});
     }
 
     // 5. Synchronize to franchise_users collection
     const fuDocRef = adminDb.collection('franchise_users').doc(targetUid);
     if (accessEntry.applications.franchiseManagement && accountStatus === 'ACTIVE') {
-      await fuDocRef.set({
+      await withTimeout(fuDocRef.set({
         id: targetUid,
         email,
         franchiseId,
@@ -268,19 +381,19 @@ export class FranchiseAccessService {
         status: 'APPROVED',
         isActive: true,
         updatedAt: now
-      }, { merge: true });
+      }, { merge: true }), 'access.fuWrite', 1000).catch(() => {});
     } else {
-      await fuDocRef.set({
+      await withTimeout(fuDocRef.set({
         isActive: false,
         status: 'DEACTIVATED',
         updatedAt: now
-      }, { merge: true }).catch(() => {});
+      }, { merge: true }), 'access.fuRevokeWrite', 1000).catch(() => {});
     }
 
     // 6. Synchronize to delivery_partners collection
     const dpDocRef = adminDb.collection('delivery_partners').doc(targetUid);
     if (accessEntry.applications.delivery && accountStatus === 'ACTIVE') {
-      await dpDocRef.set({
+      await withTimeout(dpDocRef.set({
         id: targetUid,
         email,
         franchiseId,
@@ -288,124 +401,38 @@ export class FranchiseAccessService {
         status: 'approved',
         isActive: true,
         updatedAt: now
-      }, { merge: true });
+      }, { merge: true }), 'access.dpWrite', 1000).catch(() => {});
     } else {
-      await dpDocRef.set({
+      await withTimeout(dpDocRef.set({
         isActive: false,
         status: 'suspended',
         updatedAt: now
-      }, { merge: true }).catch(() => {});
+      }, { merge: true }), 'access.dpRevokeWrite', 1000).catch(() => {});
     }
 
-    // 7. If access was revoked or account suspended, revoke refresh tokens immediately
+    // 7. Synchronize Firebase Auth custom claims (bounded)
     if (accountStatus !== 'ACTIVE' || allowedApps.length === 0) {
-      if (adminAuth) {
-        await adminAuth.revokeRefreshTokens(targetUid).catch(() => {});
+      if (adminAuth && targetUid && !targetUid.includes('@')) {
+        await withTimeout(adminAuth.revokeRefreshTokens(targetUid), 'access.revokeTokens', 1200).catch(() => {});
       }
     } else if (adminAuth && targetUid && !targetUid.includes('@')) {
-      // Set active Firebase custom claims
       try {
-        await adminAuth.setCustomUserClaims(targetUid, {
+        await withTimeout(adminAuth.setCustomUserClaims(targetUid, {
           role: targetRole,
           allowedApps,
           branchId: effectiveBranchId,
           franchiseId,
-          isOwnerMode: targetRole === 'owner',
-          admin: targetRole === 'owner' || targetRole === 'admin',
+          isOwnerMode: isOwnerRole,
+          admin: isOwnerRole || targetRole === 'admin',
           permissions: permissions.length > 0 ? permissions : ['*']
-        });
+        }), 'access.setClaims', 1200);
       } catch (claimsErr: any) {
         console.warn('[FranchiseAccessService] Error setting custom claims:', claimsErr.message);
       }
     }
 
-    // Synchronize to PostgreSQL app_users table
-    try {
-      const allowedAppsJson = JSON.stringify(allowedApps);
-      await query(
-        `INSERT INTO app_users (id, email, role, status, franchise_id, branch_id, allowed_apps, is_active, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, NOW())
-         ON CONFLICT (id) DO UPDATE SET
-           email = COALESCE(EXCLUDED.email, app_users.email),
-           role = EXCLUDED.role,
-           status = EXCLUDED.status,
-           franchise_id = EXCLUDED.franchise_id,
-           branch_id = EXCLUDED.branch_id,
-           allowed_apps = EXCLUDED.allowed_apps,
-           is_active = EXCLUDED.is_active,
-           updated_at = NOW()`,
-        [
-          targetUid,
-          email || null,
-          targetRole,
-          accountStatus === 'ACTIVE' ? 'APPROVED' : 'DISABLED',
-          franchiseId,
-          effectiveBranchId,
-          allowedAppsJson,
-          accountStatus === 'ACTIVE'
-        ]
-      );
-      if (email) {
-        await query(
-          `UPDATE app_users 
-           SET role = $2, status = $3, franchise_id = $4, branch_id = $5, allowed_apps = $6::jsonb, is_active = $7, updated_at = NOW()
-           WHERE email IS NOT NULL AND LOWER(email) = LOWER($1) AND id <> $8`,
-          [
-            email,
-            targetRole,
-            accountStatus === 'ACTIVE' ? 'APPROVED' : 'DISABLED',
-            franchiseId,
-            effectiveBranchId,
-            allowedAppsJson,
-            accountStatus === 'ACTIVE',
-            targetUid
-          ]
-        ).catch(() => {});
-      }
-    } catch (pgSyncErr: any) {
-      console.warn('[FranchiseAccessService] PostgreSQL app_users sync notice:', pgSyncErr.message);
-    }
-
-    // Synchronize to PostgreSQL delivery_partners table if delivery granted
-    if (accessEntry.applications.delivery && accountStatus === 'ACTIVE') {
-      try {
-        await query(
-          `INSERT INTO delivery_partners (id, name, email, phone, status, is_online, branch_id, franchise_id, updated_at)
-           VALUES ($1, $2, $3, $4, 'APPROVED', true, $5, $6, NOW())
-           ON CONFLICT (id) DO UPDATE SET
-             email = COALESCE(EXCLUDED.email, delivery_partners.email),
-             status = 'APPROVED',
-             is_online = true,
-             branch_id = EXCLUDED.branch_id,
-             franchise_id = EXCLUDED.franchise_id,
-             updated_at = NOW()`,
-          [
-            targetUid,
-            (userDocSnap.exists ? (userDocSnap.data()?.name || userDocSnap.data()?.displayName) : null) || 'Delivery Partner',
-            email || null,
-            (userDocSnap.exists ? (userDocSnap.data()?.phone || userDocSnap.data()?.phoneNumber) : null) || null,
-            effectiveBranchId,
-            franchiseId
-          ]
-        );
-      } catch (dpPgErr: any) {
-        console.warn('[FranchiseAccessService] PostgreSQL delivery_partners sync notice:', dpPgErr.message);
-      }
-    } else {
-      try {
-        await query(
-          `UPDATE delivery_partners
-           SET status = 'DISABLED', is_online = false, updated_at = NOW()
-           WHERE id = $1`,
-          [targetUid]
-        );
-      } catch (dpPgErr: any) {
-        console.warn('[FranchiseAccessService] PostgreSQL delivery_partners disable notice:', dpPgErr.message);
-      }
-    }
-
-    // 8. Audit log
-    await FranchiseScopeService.logFranchiseAudit({
+    // 8. Audit log (best-effort)
+    await withTimeout(FranchiseScopeService.logFranchiseAudit({
       organizationId: FranchiseScopeService.DEFAULT_ORG_ID,
       franchiseId,
       branchId: effectiveBranchId,
@@ -420,7 +447,7 @@ export class FranchiseAccessService {
         allowedApps,
         accountStatus
       }
-    });
+    }), 'access.auditLog', 1000).catch(() => {});
 
     return {
       success: true,
@@ -823,7 +850,15 @@ export class FranchiseAccessService {
         }
       }
     } else {
-      // Platform Owner can dynamically switch branch and franchise context
+      // Strict Single-App Policy (A1): Owner accounts ONLY access OWNER portal (or Customer consumer portal),
+      // never operational management portals (POS, Restaurant Manager, Franchise Manager, Delivery).
+      if (['POS', 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'DELIVERY'].includes(targetApp)) {
+        return {
+          authorized: false,
+          code: 'OWNER_PORTAL_ONLY',
+          reason: `Owner accounts cannot log into ${targetApp}. Use a dedicated branch/franchise staff account, or view all franchises in the Owner Portal.`
+        };
+      }
       if (requestedBranchId) {
         resolvedBranch = requestedBranchId;
       } else if (!resolvedBranch) {

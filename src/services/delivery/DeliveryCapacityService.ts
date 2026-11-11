@@ -56,6 +56,61 @@ export class DeliveryCapacityService {
    */
   static async getRestaurantAvailability(targetBranchId?: string) {
     try {
+      const branchId = targetBranchId && targetBranchId !== 'all' ? targetBranchId : 'main_branch';
+      
+      // 1. Authoritative PostgreSQL branch and fleet evaluation (0ms quota-free)
+      try {
+        const branchRes = await pgPool.query(
+          `SELECT id, name, is_open, delivery_settings 
+           FROM restaurant_branches 
+           WHERE id = $1 LIMIT 1`,
+          [branchId]
+        );
+        
+        if (branchRes.rows.length > 0) {
+          const bRow = branchRes.rows[0];
+          const bSettings = bRow.delivery_settings || {};
+          const isBranchOpen = bRow.is_open !== false;
+          
+          const fleetRes = await pgPool.query(
+            `SELECT 
+               COUNT(*) as total_riders,
+               COUNT(*) FILTER (WHERE is_online = true) as online_count,
+               COUNT(*) FILTER (WHERE is_online = true AND (active_order_id IS NULL OR active_order_id = '')) as available_count,
+               COUNT(*) FILTER (WHERE is_online = true AND active_order_id IS NOT NULL AND active_order_id <> '') as on_delivery_count
+             FROM delivery_partners 
+             WHERE branch_id = $1 AND status = 'APPROVED'`,
+            [branchId]
+          );
+
+          const totalRiders = parseInt(fleetRes.rows[0]?.total_riders || '0', 10);
+          const onlineCount = parseInt(fleetRes.rows[0]?.online_count || '0', 10);
+          const availableCount = parseInt(fleetRes.rows[0]?.available_count || '0', 10);
+          const onDeliveryCount = parseInt(fleetRes.rows[0]?.on_delivery_count || '0', 10);
+
+          const baseDeliveryFee = Number(bSettings.deliveryFee || 30);
+          const freeDeliveryThreshold = Number(bSettings.freeDeliveryThreshold || bSettings.freeDeliveryAbove || 500);
+
+          return {
+            isRestaurantOpen: isBranchOpen,
+            isDeliveryEnabled: true,
+            isWithinBusinessHours: true,
+            totalRiders,
+            onlineCount,
+            availableCount,
+            onDeliveryCount,
+            availabilityStatus: (isBranchOpen ? (onlineCount > 0 ? (availableCount > 0 ? 'AVAILABLE' : 'HIGH_DEMAND') : 'AVAILABLE') : 'CLOSED') as any,
+            availabilityMessage: isBranchOpen ? 'Delivery available' : 'Restaurant is currently closed',
+            canAcceptDeliveries: isBranchOpen,
+            estimatedWaitMins: 20,
+            deliveryFee: baseDeliveryFee,
+            freeDeliveryThreshold
+          };
+        }
+      } catch (pgErr: any) {
+        console.warn('[DeliveryCapacity] PostgreSQL branch lookup notice:', pgErr.message);
+      }
+
       const settingsDoc = await adminDb.collection('settings').doc('global').get();
       const settings = settingsDoc.exists ? settingsDoc.data() || {} : {};
 

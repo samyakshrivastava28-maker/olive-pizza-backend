@@ -25,30 +25,97 @@ export interface AuthoritativeUserInfo {
   role: string;
   branchId?: string;
   franchiseId?: string;
+  partnerIds?: string[];
+  isActive?: boolean;
+}
+
+function branchMatches(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return (a === 'main_branch' || a === 'branch_rjn_main') && (b === 'main_branch' || b === 'branch_rjn_main');
 }
 
 async function resolveAuthoritativeUserInfo(uid: string, tokenClaims?: any): Promise<AuthoritativeUserInfo> {
   let role = tokenClaims?.role || 'customer';
   let branchId = tokenClaims?.branchId || tokenClaims?.branch_id;
   let franchiseId = tokenClaims?.franchiseId || tokenClaims?.franchise_id;
+  let isActive = true;
+  const partnerIds = new Set<string>([uid]);
+  const emailLower = tokenClaims?.email ? String(tokenClaims.email).toLowerCase().trim() : '';
+  let resolvedFromPg = false;
 
+  // 1. Authoritative PostgreSQL resolution first
   try {
-    const userDoc = await adminDb.collection('users').doc(uid).get();
-    if (userDoc.exists) {
-      const data = userDoc.data();
-      if (data?.role) role = data.role;
-      if (data?.branchId) branchId = data.branchId;
-      if (data?.franchiseId) franchiseId = data.franchiseId;
+    const pgUser = await query(
+      `SELECT id, role, status, is_active, branch_id, franchise_id
+       FROM app_users
+       WHERE id = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2))
+       LIMIT 1`,
+      [uid, emailLower]
+    );
+    if (pgUser.rows.length > 0) {
+      const u = pgUser.rows[0];
+      if (u.is_active === false || ['REVOKED', 'SUSPENDED', 'DISABLED', 'REJECTED'].includes(u.status)) {
+        return { role: 'REVOKED', isActive: false };
+      }
+      if (u.role) role = u.role;
+      if (u.branch_id) branchId = u.branch_id;
+      if (u.franchise_id) franchiseId = u.franchise_id;
+      resolvedFromPg = true;
     }
-    const dpDoc = await adminDb.collection('delivery_partners').doc(uid).get();
-    if (dpDoc.exists && dpDoc.data()?.isActive !== false) {
-      role = 'delivery_partner';
-      if (dpDoc.data()?.branchId) branchId = dpDoc.data()?.branchId;
+
+    const pgDp = await query(
+      `SELECT id, user_id, status, is_online, branch_id, franchise_id
+       FROM delivery_partners
+       WHERE id = $1 OR user_id = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2))
+       LIMIT 1`,
+      [uid, emailLower]
+    );
+    if (pgDp.rows.length > 0) {
+      const dp = pgDp.rows[0];
+      if (['REVOKED', 'TERMINATED', 'DISABLED'].includes(dp.status)) {
+        return { role: 'REVOKED', isActive: false };
+      }
+      if (dp.id) partnerIds.add(dp.id);
+      if (dp.user_id) partnerIds.add(dp.user_id);
+      if (!resolvedFromPg || role === 'customer') {
+        role = 'delivery_partner';
+        if (dp.branch_id) branchId = dp.branch_id;
+        if (dp.franchise_id) franchiseId = dp.franchise_id;
+        resolvedFromPg = true;
+      }
     }
-  } catch (err) {
-    console.warn('[WebSocketServer] Failed to resolve user info for', uid, err);
+  } catch (pgErr) {
+    console.warn('[WebSocketServer] PostgreSQL user info resolution notice:', (pgErr as any)?.message);
   }
-  return { role, branchId, franchiseId };
+
+  // 2. Fallback to Firestore only if not found in PostgreSQL
+  if (!resolvedFromPg) {
+    try {
+      const userDoc = await adminDb.collection('users').doc(uid).get();
+      if (userDoc.exists) {
+        const data = userDoc.data();
+        if (data?.isActive === false || data?.status === 'REVOKED' || data?.role === 'REVOKED') {
+          return { role: 'REVOKED', isActive: false };
+        }
+        if (data?.role) role = data.role;
+        if (data?.branchId) branchId = data.branchId;
+        if (data?.franchiseId) franchiseId = data.franchiseId;
+      }
+      const dpDoc = await adminDb.collection('delivery_partners').doc(uid).get();
+      if (dpDoc.exists) {
+        if (dpDoc.data()?.isActive === false || dpDoc.data()?.status === 'REVOKED') {
+          return { role: 'REVOKED', isActive: false };
+        }
+        role = 'delivery_partner';
+        if (dpDoc.data()?.branchId) branchId = dpDoc.data()?.branchId;
+        if (dpDoc.data()?.franchiseId) franchiseId = dpDoc.data()?.franchiseId;
+      }
+    } catch (err) {
+      console.warn('[WebSocketServer] Failed to resolve user info for', uid, err);
+    }
+  }
+  return { role, branchId, franchiseId, partnerIds: Array.from(partnerIds), isActive };
 }
 
 export interface ConnectedClient {
@@ -57,6 +124,7 @@ export interface ConnectedClient {
   role?: string;
   branchId?: string;
   franchiseId?: string;
+  partnerIds?: string[];
   terminalId?: string;
   connectedAt: number;
   lastSeenSeq?: number;
@@ -192,16 +260,31 @@ class OliveWebSocketServer {
       let franchiseId: string | undefined = franchiseIdParam;
       let uid = 'anonymous';
       let role = 'customer';
+      let partnerIds: string[] = [];
 
-      // Verify token if supplied via handshake Authorization header
+      // Verify token if supplied via handshake Authorization header (checkRevoked = true)
       if (token) {
         try {
-          const decoded = await adminAuth.verifyIdToken(token);
+          let decoded: any;
+          try {
+            decoded = await adminAuth.verifyIdToken(token, true);
+          } catch (revErr: any) {
+            if (revErr?.code === 'auth/id-token-revoked' || revErr?.message?.includes('revoked')) {
+              ws.close(4003, 'Account revoked');
+              return;
+            }
+            decoded = await adminAuth.verifyIdToken(token, false);
+          }
           uid = decoded.uid;
           const info = await resolveAuthoritativeUserInfo(uid, decoded);
+          if (info.isActive === false || info.role === 'REVOKED') {
+            ws.close(4003, 'Account revoked');
+            return;
+          }
           role = info.role;
           branchId = info.branchId || branchIdParam;
           franchiseId = info.franchiseId || franchiseIdParam;
+          partnerIds = info.partnerIds || [uid];
         } catch (tokenErr: any) {
           const safeErr = sanitizeError(tokenErr);
           console.warn('[WebSocketServer] Handshake token verification failed:', safeErr.message);
@@ -221,6 +304,7 @@ class OliveWebSocketServer {
         role,
         branchId,
         franchiseId,
+        partnerIds,
         terminalId: terminalIdParam,
         connectedAt: Date.now(),
         subscribedOrders: new Set<string>()
@@ -262,9 +346,24 @@ class OliveWebSocketServer {
               let authUid = client.uid;
               let authRole = client.role || 'customer';
 
-              const decoded = await adminAuth.verifyIdToken(msg.token);
+              let decoded: any;
+              try {
+                decoded = await adminAuth.verifyIdToken(msg.token, true);
+              } catch (revErr: any) {
+                if (revErr?.code === 'auth/id-token-revoked' || revErr?.message?.includes('revoked')) {
+                  this.safeSend(ws, { type: 'auth_error', data: { message: 'Account revoked', code: 'ACCOUNT_REVOKED' } });
+                  ws.close(4003, 'Account revoked');
+                  return;
+                }
+                decoded = await adminAuth.verifyIdToken(msg.token, false);
+              }
               authUid = decoded.uid;
               const info = await resolveAuthoritativeUserInfo(authUid, decoded);
+              if (info.isActive === false || info.role === 'REVOKED') {
+                this.safeSend(ws, { type: 'auth_error', data: { message: 'Account revoked', code: 'ACCOUNT_REVOKED' } });
+                ws.close(4003, 'Account revoked');
+                return;
+              }
               authRole = info.role;
 
               // Update client registration with verified identity
@@ -275,6 +374,7 @@ class OliveWebSocketServer {
               client.role = authRole;
               client.branchId = info.branchId || msg.branchId || client.branchId;
               client.franchiseId = info.franchiseId || msg.franchiseId || client.franchiseId;
+              client.partnerIds = info.partnerIds || [authUid];
               if (msg.terminalId) client.terminalId = msg.terminalId;
 
               if (!this.clients.has(authUid)) this.clients.set(authUid, new Set());
@@ -382,25 +482,51 @@ class OliveWebSocketServer {
             }
 
             try {
-              const orderDoc = await adminDb.collection('orders').doc(orderId).get();
-              if (!orderDoc.exists) {
+              let orderData: any = null;
+              try {
+                const pgRes = await query(
+                  `SELECT id, customer_id, branch_id, franchise_id, delivery_partner_id FROM canonical_orders WHERE id = $1 LIMIT 1`,
+                  [orderId]
+                );
+                if (pgRes.rows.length > 0) {
+                  const r = pgRes.rows[0];
+                  orderData = {
+                    userId: r.customer_id,
+                    customerId: r.customer_id,
+                    branchId: r.branch_id,
+                    franchiseId: r.franchise_id,
+                    deliveryPartnerId: r.delivery_partner_id,
+                  };
+                }
+              } catch {}
+
+              if (!orderData) {
+                const orderDoc = await adminDb.collection('orders').doc(orderId).get().catch(() => null);
+                if (orderDoc && orderDoc.exists) {
+                  orderData = orderDoc.data() || {};
+                }
+              }
+
+              if (!orderData) {
                 this.safeSend(ws, { type: 'error', data: { message: 'Order not found', orderId } });
                 return;
               }
-              const orderData = orderDoc.data() || {};
               const userRole = (client.role || 'customer').toLowerCase();
-              const isPrivileged = ['owner', 'admin', 'developer'].includes(userRole);
-              const isStaff = ['restaurant_manager', 'branch_manager', 'cashier', 'kitchen_staff'].includes(userRole);
+              const isPrivileged = ['owner', 'platform_owner', 'admin', 'developer'].includes(userRole);
+              const isFranchiseOwner = ['franchise_owner', 'franchise_manager'].includes(userRole) &&
+                Boolean(client.franchiseId && orderData.franchiseId && client.franchiseId === orderData.franchiseId);
+              const isStaff = ['restaurant_manager', 'manager', 'branch_manager', 'cashier', 'kitchen_staff'].includes(userRole);
+              const riderIdSet = new Set([client.uid, ...(client.partnerIds || [])]);
               const isAssignedDriver = ['delivery_partner', 'rider', 'delivery'].includes(userRole) &&
-                (orderData.deliveryPartnerId === client.uid || orderData.assignedDeliveryPartnerId === client.uid);
+                (riderIdSet.has(orderData.deliveryPartnerId) || riderIdSet.has(orderData.assignedDeliveryPartnerId));
               const isOrderOwner = (
                 orderData.userId === client.uid || 
                 orderData.customerUid === client.uid || 
                 orderData.customerId === client.uid
               );
-              const isBranchStaff = isStaff && Boolean(client.branchId && client.branchId === orderData.branchId);
+              const isBranchStaff = isStaff && branchMatches(client.branchId, orderData.branchId);
 
-              if (!isPrivileged && !isOrderOwner && !isBranchStaff && !isAssignedDriver && !hasValidTrackingToken) {
+              if (!isPrivileged && !isFranchiseOwner && !isOrderOwner && !isBranchStaff && !isAssignedDriver && !hasValidTrackingToken) {
                 this.safeSend(ws, { type: 'error', data: { message: 'Forbidden: You do not have access to this order', orderId } });
                 return;
               }
@@ -438,16 +564,37 @@ class OliveWebSocketServer {
 
             const targetOrderId = msg.data.orderId ? String(msg.data.orderId).trim() : null;
             let verifiedOrderId: string | null = null;
+            let orderBranchId = client.branchId || '';
+            let orderFranchiseId = client.franchiseId || '';
+            const riderIdSet = new Set([client.uid, ...(client.partnerIds || [])]);
 
             if (targetOrderId) {
               try {
-                const orderDoc = await adminDb.collection('orders').doc(targetOrderId).get();
-                if (orderDoc.exists) {
-                  const oData = orderDoc.data() || {};
-                  const isAssigned = (oData.deliveryPartnerId === client.uid || oData.assignedDeliveryPartnerId === client.uid);
-                  const isPrivileged = ['owner', 'admin', 'developer'].includes(client.role);
+                let oData: any = null;
+                const pgRes = await query(
+                  `SELECT order_status, delivery_partner_id, branch_id, franchise_id FROM canonical_orders WHERE id = $1 LIMIT 1`,
+                  [targetOrderId]
+                );
+                if (pgRes.rows.length > 0) {
+                  const r = pgRes.rows[0];
+                  oData = {
+                    deliveryPartnerId: r.delivery_partner_id,
+                    status: r.order_status,
+                    branchId: r.branch_id,
+                    franchiseId: r.franchise_id,
+                  };
+                }
+                if (!oData) {
+                  const orderDoc = await adminDb.collection('orders').doc(targetOrderId).get().catch(() => null);
+                  if (orderDoc && orderDoc.exists) oData = orderDoc.data() || {};
+                }
+                if (oData) {
+                  const isAssigned = riderIdSet.has(oData.deliveryPartnerId) || riderIdSet.has(oData.assignedDeliveryPartnerId);
+                  const isPrivileged = ['owner', 'platform_owner', 'admin', 'developer'].includes(client.role || '');
                   const status = String(oData.status || '').toUpperCase();
                   const isActiveStage = ['OUT_FOR_DELIVERY', 'PICKED_UP', 'IN_TRANSIT'].includes(status);
+                  if (oData.branchId) orderBranchId = oData.branchId;
+                  if (oData.franchiseId) orderFranchiseId = oData.franchiseId;
 
                   if ((isAssigned || isPrivileged) && isActiveStage) {
                     verifiedOrderId = targetOrderId;
@@ -476,15 +623,18 @@ class OliveWebSocketServer {
               });
             }
 
-            // Also broadcast to fleet watchers (owners/managers)
-            this.broadcastToRole('owner', {
-              type: 'fleet_location_update',
-              data: loc
-            });
-            this.broadcastToRole('restaurant_manager', {
-              type: 'fleet_location_update',
-              data: loc
-            });
+            // Broadcast fleet GPS strictly scoped to branch/franchise & global owners
+            if (orderFranchiseId || orderBranchId) {
+              this.broadcastToBranch(orderFranchiseId, orderBranchId, {
+                type: 'fleet_location_update',
+                data: loc
+              });
+            } else {
+              this.broadcastToRole('owner', {
+                type: 'fleet_location_update',
+                data: loc
+              });
+            }
             return;
           }
 
@@ -624,18 +774,12 @@ class OliveWebSocketServer {
         }
       };
 
-      // 1. Sequenced, ring-buffered broadcast to targeted branch & supervisors
+      // 1. Sequenced, ring-buffered broadcast to strictly scoped branch, franchise & global owners
       this.broadcastToBranch(franchiseId, branchId, {
         type: 'order.created',
         eventId: `order_${event.orderId}`,
         data: fullOrderPayload
       });
-
-      // 2. Legacy backwards-compatible role broadcasts
-      this.broadcastToRole('restaurant', { type: 'order.created', data: fullOrderPayload });
-      this.broadcastToRole('manager', { type: 'order.created', data: fullOrderPayload });
-      this.broadcastToRole('restaurant_manager', { type: 'order.created', data: fullOrderPayload });
-      this.broadcastToRole('pos', { type: 'order.created', data: fullOrderPayload });
     });
 
     console.log('[WebSocketServer] Attached to HTTP server on path /ws');
@@ -771,19 +915,25 @@ class OliveWebSocketServer {
     for (const userClients of this.clients.values()) {
       for (const client of userClients) {
         if (client.ws.readyState !== WebSocket.OPEN) continue;
+        if (!client.uid || client.uid === 'anonymous') continue;
 
-        // Direct branch match
-        const isBranchMatch = (!client.branchId || client.branchId === branchId) &&
-                             (!client.franchiseId || client.franchiseId === franchiseId);
+        const r = (client.role || '').toLowerCase();
 
-        // Supervisors (Owner / Admin / Developer) get all branches ONLY IF they are platform-wide (no franchiseId attached)
-        const isSupervisor = (client.role === 'owner' || client.role === 'admin' || client.role === 'developer') && !client.franchiseId;
+        // Global supervisors (Owner / Platform Owner / Admin / Developer) without branch/franchise restriction
+        const isGlobalSupervisor = ['owner', 'platform_owner', 'admin', 'developer'].includes(r) &&
+          (!client.franchiseId || client.franchiseId === 'fra_primary' || !franchiseId || client.franchiseId === franchiseId);
 
-        // Franchise manager or franchise owner gets their franchise
-        const isFranchiseManager = (client.role === 'franchise_manager' || client.role === 'franchise_owner' || client.role === 'owner') && 
-                                   client.franchiseId === franchiseId;
+        // Franchise manager/owner gets all branches within their exact franchise
+        const isFranchiseManager = ['franchise_manager', 'franchise_owner'].includes(r) &&
+          Boolean(franchiseId && client.franchiseId && client.franchiseId === franchiseId);
 
-        if (isBranchMatch || isSupervisor || isFranchiseManager) {
+        // Staff (restaurant manager / kitchen / cashier / delivery) must explicitly match branch (with main_branch <-> branch_rjn_main alias)
+        const isOperationalStaff = ['restaurant_manager', 'manager', 'branch_manager', 'kitchen_staff', 'cashier', 'pos', 'pos_operator', 'delivery_partner', 'delivery', 'rider'].includes(r);
+        const isBranchMatch = isOperationalStaff &&
+          branchMatches(client.branchId, branchId) &&
+          (!client.franchiseId || !franchiseId || client.franchiseId === franchiseId || client.franchiseId === 'fra_primary');
+
+        if (isGlobalSupervisor || isFranchiseManager || isBranchMatch) {
           client.lastSeenSeq = ringEvent.seq;
           client.ws.send(payload);
         }

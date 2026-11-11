@@ -102,7 +102,26 @@ export class GeofenceVerificationService {
       console.warn(`[GeofenceVerificationService] Supabase GPS lookup warning for ${riderUid}:`, err?.message);
     }
 
-    // Secondary fallback: delivery_partners collection in Firestore
+    // Secondary fallback: PostgreSQL delivery_partners table (Authoritative)
+    if (riderLat === null || riderLng === null) {
+      try {
+        const { query } = await import('../../lib/db.js');
+        const dpPg = await query(
+          'SELECT current_lat, current_lng, EXTRACT(EPOCH FROM last_location_time)*1000 AS ts FROM delivery_partners WHERE id = $1 OR user_id = $1 LIMIT 1',
+          [riderUid]
+        );
+        if (dpPg.rows.length > 0 && dpPg.rows[0].current_lat != null && dpPg.rows[0].current_lng != null) {
+          riderLat = Number(dpPg.rows[0].current_lat);
+          riderLng = Number(dpPg.rows[0].current_lng);
+          accuracyMeters = 10;
+          locationTimestamp = Number(dpPg.rows[0].ts) || Date.now();
+        }
+      } catch (pgErr: any) {
+        console.warn(`[GeofenceVerificationService] PostgreSQL fallback warning for ${riderUid}:`, pgErr?.message);
+      }
+    }
+
+    // Tertiary fallback: delivery_partners collection in Firestore
     if (riderLat === null || riderLng === null) {
       try {
         const dpDoc = await adminDb.collection('delivery_partners').doc(riderUid).get();

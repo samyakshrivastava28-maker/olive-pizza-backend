@@ -2,6 +2,7 @@ import { adminDb } from '../../config/firebase.js';
 import { notificationEngine } from '../notification/NotificationEngine.js';
 import { PostgresGpsService } from '../gps/PostgresGpsService.js';
 import { getClient, query } from '../../lib/db.js';
+import { withTimeout } from '../../lib/utils.js';
 
 export interface EligibleRider {
   uid: string;
@@ -122,7 +123,7 @@ export class RiderDispatchEngine {
       let partnerSql = `
         SELECT id AS uid, name, phone, branch_id, franchise_id, current_lat, current_lng, is_online, active_order_id
         FROM delivery_partners
-        WHERE branch_id = $1
+        WHERE (branch_id = $1 OR (branch_id IN ('main_branch', 'branch_rjn_main') AND $1 IN ('main_branch', 'branch_rjn_main')))
           AND status = 'APPROVED'
           AND is_online = true
           AND (active_order_id IS NULL OR active_order_id = '')
@@ -132,7 +133,7 @@ export class RiderDispatchEngine {
         partnerParams.push(franchiseId);
         partnerSql += ` AND franchise_id = $${partnerParams.length}`;
       }
-      partnerSql += ` LIMIT 10`;
+      partnerSql += ` ORDER BY id ASC LIMIT 10`;
 
       const partnerRes = await query(partnerSql, partnerParams);
       if (partnerRes.rows.length > 0) {
@@ -154,16 +155,21 @@ export class RiderDispatchEngine {
       console.warn('[RiderDispatchEngine] PostgreSQL fallback partner discovery notice:', e.message);
     }
 
-    // 6. Transitional Firestore fallback for unmigrated test mock riders
+    // 6. Transitional Firestore fallback for unmigrated riders (bounded so Spark quota never stalls dispatch)
     try {
       const ridersMap = new Map<string, any>();
-      const ridersSnap = await adminDb.collection('users')
-        .where('role', 'in', ['delivery_partner', 'delivery'])
-        .get()
-        .catch(() => ({ docs: [] } as any));
+      const ridersSnap = await withTimeout(
+        adminDb.collection('users').where('role', 'in', ['delivery_partner', 'delivery']).get(),
+        'dispatch.fsUsers',
+        1200
+      ).catch(() => ({ docs: [] } as any));
       (ridersSnap.docs || []).forEach((doc: any) => ridersMap.set(doc.id, { uid: doc.id, ...doc.data() }));
 
-      const dpSnap = await adminDb.collection('delivery_partners').get().catch(() => ({ docs: [] } as any));
+      const dpSnap = await withTimeout(
+        adminDb.collection('delivery_partners').get(),
+        'dispatch.fsPartners',
+        1200
+      ).catch(() => ({ docs: [] } as any));
       (dpSnap.docs || []).forEach((doc: any) => {
         const d = doc.data();
         const uid = d.uid || doc.id;
@@ -316,7 +322,7 @@ export class RiderDispatchEngine {
       // Check if order even exists in Firestore to give precise fail-closed reason
       let firestoreOrderData: any = null;
       try {
-        const docSnap = await adminDb.collection('orders').doc(orderId).get();
+        const docSnap = await withTimeout(adminDb.collection('orders').doc(orderId).get(), 'dispatch.orderRead', 1200);
         if (!docSnap.exists) {
           return {
             success: false,
@@ -414,7 +420,7 @@ export class RiderDispatchEngine {
           const dpRes = await acquiredClient.query(
             `SELECT id, name, phone, status, is_online, active_order_id, branch_id, franchise_id
              FROM delivery_partners
-             WHERE id = $1 AND branch_id = $2
+             WHERE id = $1 AND (branch_id = $2 OR (branch_id IN ('main_branch', 'branch_rjn_main') AND $2 IN ('main_branch', 'branch_rjn_main')))
              FOR UPDATE NOWAIT`,
             [candidate.uid, branchId]
           );
@@ -436,11 +442,6 @@ export class RiderDispatchEngine {
           // Row is locked by another concurrent assignment, proceed to next candidate
           continue;
         }
-      }
-
-      if (!assignedRider && candidates.length > 0) {
-        // Fallback for mock/test accounts not yet in delivery_partners table
-        assignedRider = candidates[0];
       }
 
       if (!assignedRider) {
@@ -515,26 +516,26 @@ export class RiderDispatchEngine {
       const now = new Date();
       const isoNow = now.toISOString();
       const orderRef = adminDb.collection('orders').doc(orderId);
-      await orderRef.set({
-        status: 'partner_assigned',
-        deliveryPartnerId: assignedRider.uid,
-        deliveryPartnerName: assignedRider.name,
-        deliveryPartnerPhone: assignedRider.phone,
-        partnerAssignedAt: isoNow,
-        riderAssignedAt: isoNow,
-        riderAssignmentStatus: 'assigned',
-        updatedAt: now,
-      }, { merge: true });
-
-      await adminDb.collection('users').doc(assignedRider.uid).set(
-        { activeOrderId: orderId },
-        { merge: true }
-      ).catch(() => {});
-
-      await adminDb.collection('delivery_partners').doc(assignedRider.uid).set(
-        { activeOrderId: orderId },
-        { merge: true }
-      ).catch(() => {});
+      await Promise.all([
+        withTimeout(orderRef.set({
+          status: 'partner_assigned',
+          deliveryPartnerId: assignedRider.uid,
+          deliveryPartnerName: assignedRider.name,
+          deliveryPartnerPhone: assignedRider.phone,
+          partnerAssignedAt: isoNow,
+          riderAssignedAt: isoNow,
+          riderAssignmentStatus: 'assigned',
+          updatedAt: now,
+        }, { merge: true }), 'dispatch.orderWrite', 1200).catch(() => {}),
+        withTimeout(adminDb.collection('users').doc(assignedRider.uid).set(
+          { activeOrderId: orderId },
+          { merge: true }
+        ), 'dispatch.userWrite', 1000).catch(() => {}),
+        withTimeout(adminDb.collection('delivery_partners').doc(assignedRider.uid).set(
+          { activeOrderId: orderId },
+          { merge: true }
+        ), 'dispatch.dpWrite', 1000).catch(() => {}),
+      ]);
     } catch (fsErr: any) {
       console.warn('[RiderDispatchEngine] Firestore realtime sync notice:', fsErr.message);
     }

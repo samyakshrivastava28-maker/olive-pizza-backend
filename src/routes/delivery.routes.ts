@@ -4,6 +4,7 @@ import { adminDb } from '../config/firebase.js';
 import { FieldValue } from 'firebase-admin/firestore';
 import { orderEventService } from '../services/order/OrderEventService.js';
 import { pgPool } from '../config/postgres.js';
+import { withTimeout, getIstDateKey } from '../lib/utils.js';
 import { z } from 'zod';
 import { CustomerTemplates, RestaurantTemplates } from '../services/notification/NotificationTemplates.js';
 import { notificationEngine } from '../services/notification/NotificationEngine.js';
@@ -375,25 +376,38 @@ const handleLocationUpdate = async (req: AuthRequest, res: Response) => {
       }
     } catch {}
 
-    // 2. Check Delivery Radius Warning
-    const settingsSnap = await adminDb.collection('settings').doc('store').get();
-    const settings = settingsSnap.data() || {};
-    const storeLat = settings.restaurantLat || 28.6139; // Default fallback
-    const storeLng = settings.restaurantLng || 77.2090;
-    const maxRadius = settings.deliveryRadiusKm || 5;
+    // 2. Check Delivery Radius Warning (bounded Firestore + branch India coords)
+    const settingsSnap = await withTimeout(adminDb.collection('settings').doc('store').get(), 'delivery.storeSettings', 1200).catch(() => null);
+    const settings = settingsSnap?.data?.() || {};
+    let storeLat = settings.restaurantLat || 21.0970;
+    let storeLng = settings.restaurantLng || 81.0330;
+    let maxRadius = settings.deliveryRadiusKm || 15;
+    if (gpsRes.branchId) {
+      const bCoords = await pgPool.query(
+        `SELECT latitude, longitude, delivery_settings FROM restaurant_branches WHERE id = $1 LIMIT 1`,
+        [gpsRes.branchId]
+      ).catch(() => ({ rows: [] as any[] }));
+      if (bCoords.rows[0]?.latitude != null && bCoords.rows[0]?.longitude != null) {
+        storeLat = Number(bCoords.rows[0].latitude);
+        storeLng = Number(bCoords.rows[0].longitude);
+      }
+      if (bCoords.rows[0]?.delivery_settings?.radiusKm) {
+        maxRadius = Number(bCoords.rows[0].delivery_settings.radiusKm);
+      }
+    }
 
     const distance = DeliveryCapacityService.getDistanceKm(storeLat, storeLng, actualLat, actualLng);
     if (distance > maxRadius) {
       // Broadcast warning to owner via websockets/firestore
       const warningMsg = `⚠ Delivery Partner ${deliveryPartnerId} is outside delivery radius (${distance.toFixed(1)}km away).`;
-      await adminDb.collection('owner_alerts').add({
+      await withTimeout(adminDb.collection('owner_alerts').add({
         type: 'radius_warning',
         message: warningMsg,
         partnerId: deliveryPartnerId,
         distance,
         timestamp: FieldValue.serverTimestamp(),
         acknowledged: false
-      });
+      }), 'delivery.ownerAlertAdd', 1000).catch(() => {});
       // Emit scoped websocket event to branch dashboard / fleet supervisor
       if (gpsRes.franchiseId && gpsRes.branchId) {
         webSocketServer.broadcastToBranch(gpsRes.franchiseId, gpsRes.branchId, {
@@ -430,32 +444,49 @@ router.post('/orders/:id/assign-partner', requireRole(['restaurant_manager', 'ow
       return;
     }
 
-    // Verify rider eligibility: must be online and not handling another active order
-    const riderDoc = await adminDb.collection('users').doc(deliveryPartnerId).get();
-    if (!riderDoc.exists) {
+    // Verify rider eligibility from PostgreSQL delivery_partners first, then bounded Firestore
+    const pgRiderRes = await pgPool.query(
+      `SELECT id, user_id, name, phone, is_online, status, active_order_id, franchise_id, branch_id
+       FROM delivery_partners
+       WHERE id = $1 OR user_id = $1
+       LIMIT 1`,
+      [deliveryPartnerId]
+    ).catch(() => ({ rows: [] as any[] }));
+    const pgRider = pgRiderRes.rows[0] || null;
+
+    const riderDoc = await withTimeout(adminDb.collection('users').doc(deliveryPartnerId).get(), 'delivery.assignRiderRead', 1200).catch(() => null);
+    if (!pgRider && (!riderDoc || !riderDoc.exists)) {
       res.status(404).json({ error: 'Delivery partner not found' });
       return;
     }
 
-    const rData = riderDoc.data()!;
-    if (rData.isOnline === false || rData.isActive === false) {
+    const rData = riderDoc?.exists ? riderDoc.data()! : {};
+    const isOnline = pgRider ? pgRider.is_online !== false : rData.isOnline !== false;
+    const isActive = pgRider ? !['REVOKED', 'DEACTIVATED', 'SUSPENDED', 'REJECTED'].includes(String(pgRider.status || '').toUpperCase()) : rData.isActive !== false;
+    const busyOrderId = pgRider?.active_order_id || rData.activeOrderId || null;
+
+    if (!isOnline || !isActive) {
       res.status(400).json({ error: 'Selected delivery partner is currently offline or inactive.' });
       return;
     }
 
-    if (rData.activeOrderId && rData.activeOrderId !== id) {
+    if (busyOrderId && busyOrderId !== id) {
       res.status(400).json({ error: 'Selected delivery partner is already on an active delivery assignment.' });
       return;
     }
+
+    const resolvedPartnerId = pgRider?.id || deliveryPartnerId;
+    const resolvedPartnerName = deliveryPartnerName || pgRider?.name || rData.name || 'Delivery Partner';
+    const resolvedPartnerPhone = deliveryPartnerPhone || pgRider?.phone || rData.phone || '';
 
     const result = await OrderStateMachine.transition(
       id,
       'partner_assigned',
       { uid: req.user!.uid, role: req.user!.role || 'restaurant_manager', name: req.user!.email },
       {
-        deliveryPartnerId,
-        deliveryPartnerName: deliveryPartnerName || rData.name || 'Delivery Partner',
-        deliveryPartnerPhone: deliveryPartnerPhone || rData.phone || '',
+        deliveryPartnerId: resolvedPartnerId,
+        deliveryPartnerName: resolvedPartnerName,
+        deliveryPartnerPhone: resolvedPartnerPhone,
         manualAssignment: true,
         assignedByUid: req.user!.uid,
       }
@@ -466,14 +497,19 @@ router.post('/orders/:id/assign-partner', requireRole(['restaurant_manager', 'ow
       return;
     }
 
-    // Set rider busy status
-    await adminDb.collection('users').doc(deliveryPartnerId).update({
+    await pgPool.query(
+      `UPDATE delivery_partners SET active_order_id = $2, updated_at = NOW() WHERE id = $1 OR user_id = $1`,
+      [resolvedPartnerId, id]
+    ).catch(() => {});
+
+    // Set rider busy status in Firestore (non-blocking if quota exhausted)
+    await withTimeout(adminDb.collection('users').doc(deliveryPartnerId).set({
       activeOrderId: id,
       isBusy: true,
       updatedAt: new Date(),
-    });
+    }, { merge: true }), 'delivery.assignRiderWrite', 1200).catch(() => {});
 
-    res.json({ success: true, message: 'Rider manually assigned successfully', orderId: id, deliveryPartnerId });
+    res.json({ success: true, message: 'Rider manually assigned successfully', orderId: id, deliveryPartnerId: resolvedPartnerId });
   } catch (err: any) {
     console.error('[Delivery Routes] Manual assign error:', err);
     res.status(500).json({ error: 'Failed to assign rider' });
@@ -625,35 +661,53 @@ router.post('/orders/:id/decline', requireRole(['delivery', 'delivery_partner', 
     const riderId = req.user?.uid;
     const { reason } = req.body;
 
-    const orderDoc = await adminDb.collection('orders').doc(id).get();
-    if (!orderDoc.exists) {
+    const orderDoc = await withTimeout(adminDb.collection('orders').doc(id).get(), 'delivery.declineOrderRead', 1200).catch(() => null);
+    const pgOrdRes = await pgPool.query(
+      `SELECT id, order_status, delivery_partner_id, metadata FROM canonical_orders WHERE id = $1 LIMIT 1`,
+      [id]
+    ).catch(() => ({ rows: [] as any[] }));
+    const pgOrd = pgOrdRes.rows[0] || null;
+    if (!pgOrd && (!orderDoc || !orderDoc.exists)) {
       res.status(404).json({ error: 'Order not found' });
       return;
     }
 
-    const oData = orderDoc.data()!;
+    const oData = orderDoc?.exists ? orderDoc.data()! : (pgOrd?.metadata || {});
     const declinedPartners = Array.isArray(oData.declinedPartnerIds) ? [...oData.declinedPartnerIds] : [];
     if (riderId && !declinedPartners.includes(riderId)) {
       declinedPartners.push(riderId);
     }
 
-    // Clear active rider assignment on order and record declined ID
-    await adminDb.collection('orders').doc(id).update({
+    await pgPool.query(
+      `UPDATE canonical_orders
+       SET delivery_partner_id = NULL, delivery_partner_name = NULL, partner_assigned_at = NULL,
+           metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{declinedPartnerIds}', $2::jsonb, true),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [id, JSON.stringify(declinedPartners)]
+    ).catch(() => {});
+
+    // Clear active rider assignment on order and record declined ID (bounded Firestore)
+    await withTimeout(adminDb.collection('orders').doc(id).set({
       deliveryPartnerId: null,
       deliveryPartnerName: null,
       deliveryPartnerPhone: null,
       declinedPartnerIds: declinedPartners,
       lastDeclineReason: reason || 'Rider declined assignment',
       updatedAt: new Date(),
-    });
+    }, { merge: true }), 'delivery.declineOrderWrite', 1200).catch(() => {});
 
     // Release rider busy state
     if (riderId) {
-      await adminDb.collection('users').doc(riderId).update({
+      await pgPool.query(
+        `UPDATE delivery_partners SET active_order_id = NULL, updated_at = NOW() WHERE id = $1 OR user_id = $1`,
+        [riderId]
+      ).catch(() => {});
+      await withTimeout(adminDb.collection('users').doc(riderId).set({
         activeOrderId: null,
         isBusy: false,
         updatedAt: new Date(),
-      }).catch(() => {});
+      }, { merge: true }), 'delivery.declineRiderRelease', 1200).catch(() => {});
     }
 
     // Auto-dispatch next available eligible rider in the background
@@ -673,36 +727,48 @@ router.post('/orders/:id/decline', requireRole(['delivery', 'delivery_partner', 
 router.get('/rider/me', requireRole(['delivery', 'delivery_partner', 'owner', 'admin', 'developer', 'restaurant_manager']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const uid = req.user!.uid;
-    const userDoc = await adminDb.collection('users').doc(uid).get();
-    
-    if (!userDoc.exists) {
-      // If user profile is not in users yet, check email or provide fallback
+    const email = (req.user?.email || '').trim().toLowerCase();
+    const pgRiderRes = await pgPool.query(
+      `SELECT dp.id, dp.user_id, dp.name, dp.phone, dp.email, dp.franchise_id, dp.branch_id,
+              dp.vehicle_type, dp.vehicle_number, dp.is_online, dp.active_order_id, dp.total_deliveries,
+              rb.name AS branch_name, rb.address AS branch_address, rb.phone AS branch_phone
+       FROM delivery_partners dp
+       LEFT JOIN restaurant_branches rb ON rb.id = dp.branch_id
+       WHERE dp.id = $1 OR dp.user_id = $1 OR ($2 <> '' AND LOWER(dp.email) = LOWER($2))
+       ORDER BY (dp.id = $1 OR dp.user_id = $1) DESC
+       LIMIT 1`,
+      [uid, email]
+    ).catch(() => ({ rows: [] as any[] }));
+    const pgRider = pgRiderRes.rows[0] || null;
+
+    const userDoc = await withTimeout(adminDb.collection('users').doc(uid).get(), 'delivery.riderMeRead', 1200).catch(() => null);
+    if (!pgRider && (!userDoc || !userDoc.exists)) {
       res.status(404).json({ success: false, error: 'Rider profile not found in database' });
       return;
     }
 
-    const data = userDoc.data()!;
+    const data = userDoc?.exists ? userDoc.data()! : {};
     const isOwner = req.user!.role === 'owner' || req.user!.role === 'platform_owner';
     
     const rider = {
       uid,
-      id: uid,
-      name: data.name || req.user!.email?.split('@')[0] || 'Delivery Partner',
-      email: data.email || req.user!.email || '',
-      phone: data.phone || data.contactPhone || null,
+      id: pgRider?.id || uid,
+      name: pgRider?.name || data.name || req.user!.email?.split('@')[0] || 'Delivery Partner',
+      email: pgRider?.email || data.email || req.user!.email || '',
+      phone: pgRider?.phone || data.phone || data.contactPhone || null,
       role: isOwner ? 'owner' : (data.role || 'delivery_partner'),
-      vehicleType: data.vehicleType || null,
-      vehicleNumber: data.vehicleNumber || null,
+      vehicleType: pgRider?.vehicle_type || data.vehicleType || null,
+      vehicleNumber: pgRider?.vehicle_number || data.vehicleNumber || null,
       organizationId: data.organizationId || 'org_olive_pizza',
-      franchiseId: data.franchiseId || null,
-      branchId: data.branchId || null,
-      branchName: data.branchName || null,
-      branchAddress: data.branchAddress || null,
-      branchPhone: data.branchPhone || null,
-      isOnline: data.isOnline !== false,
+      franchiseId: pgRider?.franchise_id || data.franchiseId || req.user?.franchiseId || null,
+      branchId: pgRider?.branch_id || data.branchId || req.user?.branchId || null,
+      branchName: pgRider?.branch_name || data.branchName || null,
+      branchAddress: pgRider?.branch_address || data.branchAddress || null,
+      branchPhone: pgRider?.branch_phone || data.branchPhone || null,
+      isOnline: pgRider ? pgRider.is_online !== false : data.isOnline !== false,
       rating: data.rating != null ? Number(data.rating) : null,
-      totalDeliveriesLifetime: data.totalDeliveriesLifetime || 0,
-      activeOrderId: data.activeOrderId || null
+      totalDeliveriesLifetime: pgRider?.total_deliveries ?? data.totalDeliveriesLifetime ?? 0,
+      activeOrderId: pgRider?.active_order_id || data.activeOrderId || null
     };
 
     res.json({ success: true, rider });
@@ -720,6 +786,20 @@ router.post('/rider/status', requireRole(['delivery', 'delivery_partner', 'owner
     const isOnlineBool = Boolean(isOnline);
     const isBackgroundTelemetry = Boolean(backgroundService);
 
+    const finalLat = lat ?? latitude;
+    const finalLng = lng ?? longitude;
+
+    await pgPool.query(
+      `UPDATE delivery_partners
+       SET is_online = $2,
+           current_lat = COALESCE($3, current_lat),
+           current_lng = COALESCE($4, current_lng),
+           last_location_time = CASE WHEN $3 IS NOT NULL THEN NOW() ELSE last_location_time END,
+           updated_at = NOW()
+       WHERE id = $1 OR user_id = $1`,
+      [uid, isOnlineBool, finalLat != null ? Number(finalLat) : null, finalLng != null ? Number(finalLng) : null]
+    ).catch(() => {});
+
     const updatePayload: any = {
       isOnline: isOnlineBool,
       status: isOnlineBool ? 'available' : 'offline',
@@ -727,8 +807,6 @@ router.post('/rider/status', requireRole(['delivery', 'delivery_partner', 'owner
       updatedAt: FieldValue.serverTimestamp()
     };
 
-    const finalLat = lat ?? latitude;
-    const finalLng = lng ?? longitude;
     if (finalLat != null && finalLng != null) {
       updatePayload.latitude = Number(finalLat);
       updatePayload.longitude = Number(finalLng);
@@ -738,8 +816,10 @@ router.post('/rider/status', requireRole(['delivery', 'delivery_partner', 'owner
 
     // Avoid continuous Firestore quota exhaustion during 5s background telemetry
     if (!isBackgroundTelemetry) {
-      await adminDb.collection('users').doc(uid).set(updatePayload, { merge: true });
-      await adminDb.collection('delivery_partners').doc(uid).set(updatePayload, { merge: true }).catch(() => {});
+      await Promise.all([
+        withTimeout(adminDb.collection('users').doc(uid).set(updatePayload, { merge: true }), 'delivery.riderStatusUsersWrite', 1200).catch(() => {}),
+        withTimeout(adminDb.collection('delivery_partners').doc(uid).set(updatePayload, { merge: true }), 'delivery.riderStatusDpWrite', 1200).catch(() => {}),
+      ]);
     }
 
     if (finalLat != null && finalLng != null) {
@@ -784,16 +864,11 @@ router.post('/rider/status', requireRole(['delivery', 'delivery_partner', 'owner
   }
 });
 
-// ─── GET /rider/stats — Today's Shift Metrics ────────────────────────────────
+// ─── GET /rider/stats — Today's Shift Metrics (IST / Asia/Kolkata) ─────────
 router.get('/rider/stats', requireRole(['delivery', 'delivery_partner', 'owner', 'admin']), async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const uid = req.user!.uid;
-    const todayStr = new Date().toISOString().split('T')[0];
-
-    const ordersSnap = await adminDb.collection('orders')
-      .where('deliveryPartnerId', '==', uid)
-      .limit(100)
-      .get();
+    const todayStr = getIstDateKey();
 
     let assigned = 0;
     let completed = 0;
@@ -803,14 +878,46 @@ router.get('/rider/stats', requireRole(['delivery', 'delivery_partner', 'owner',
     let totalDurationMin = 0;
     let durationCount = 0;
 
-    ordersSnap.forEach((doc) => {
+    const seenIds = new Set<string>();
+    const pgStatsRes = await pgPool.query(
+      `SELECT o.id, LOWER(o.order_status) AS status, o.partner_assigned_at, o.delivered_at
+       FROM canonical_orders o
+       WHERE (o.delivery_partner_id = $1 OR o.delivery_partner_id IN (SELECT id FROM delivery_partners WHERE user_id = $1 OR id = $1))
+       ORDER BY o.created_at DESC
+       LIMIT 100`,
+      [uid]
+    ).catch(() => ({ rows: [] as any[] }));
+
+    for (const row of pgStatsRes.rows) {
+      seenIds.add(row.id);
+      assigned++;
+      if (row.status === 'delivered' || row.status === 'completed') {
+        completed++;
+        earnings += 40;
+        if (row.partner_assigned_at && row.delivered_at) {
+          const dur = (new Date(row.delivered_at).getTime() - new Date(row.partner_assigned_at).getTime()) / 60000;
+          if (dur > 0) { totalDurationMin += dur; durationCount++; }
+        }
+      } else if (['partner_assigned', 'picked_up', 'out_for_delivery'].includes(row.status)) {
+        active++;
+      } else if (row.status === 'cancelled' || row.status === 'rejected') {
+        cancelled++;
+      }
+    }
+
+    const ordersSnap = await withTimeout(
+      adminDb.collection('orders').where('deliveryPartnerId', '==', uid).limit(100).get(),
+      'delivery.riderStatsRead',
+      1200
+    ).catch(() => null);
+
+    ordersSnap?.forEach((doc: any) => {
+      if (seenIds.has(doc.id)) return;
       const order = doc.data();
       assigned++;
       if (order.status === 'delivered') {
         completed++;
-        earnings += 40; // Flat ₹40 payout per delivered order
-
-        // Real duration calculation
+        earnings += 40;
         const start = order.pickedUpAt ? new Date(order.pickedUpAt).getTime() : (order.partnerAssignedAt ? new Date(order.partnerAssignedAt).getTime() : null);
         const end = order.deliveredAt ? new Date(order.deliveredAt).getTime() : null;
         if (start && end && end > start) {
@@ -833,9 +940,10 @@ router.get('/rider/stats', requireRole(['delivery', 'delivery_partner', 'owner',
         completed,
         active,
         cancelled,
-        totalDistanceKm: 0, // Computed strictly from live GPS odometer in delivery app
+        totalDistanceKm: 0,
         averageDeliveryTimeMin,
         earnings,
+        currency: 'INR',
         date: todayStr
       }
     });
@@ -850,29 +958,47 @@ router.get('/rider/reports', requireRole(['delivery', 'delivery_partner', 'owner
   try {
     const uid = req.user!.uid;
     const now = new Date();
-    const currentMonth = now.toLocaleString('default', { month: 'long', year: 'numeric' });
+    const currentMonth = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', month: 'long', year: 'numeric' });
 
-    const ordersSnap = await adminDb.collection('orders')
-      .where('deliveryPartnerId', '==', uid)
-      .where('status', '==', 'delivered')
-      .limit(200)
-      .get();
+    const seenIds = new Set<string>();
+    const pgDeliveredRes = await pgPool.query(
+      `SELECT id, partner_assigned_at, delivered_at
+       FROM canonical_orders
+       WHERE (delivery_partner_id = $1 OR delivery_partner_id IN (SELECT id FROM delivery_partners WHERE user_id = $1 OR id = $1))
+         AND order_status IN ('DELIVERED', 'COMPLETED')
+       LIMIT 200`,
+      [uid]
+    ).catch(() => ({ rows: [] as any[] }));
 
-    const deliveredCount = ordersSnap.size;
-    const monthlyEarnings = deliveredCount * 40;
-
-    // Calculate real on-time rate and ratings from actual orders
+    let deliveredCount = 0;
     let onTimeCount = 0;
     let totalRated = 0;
     let sumRating = 0;
 
-    ordersSnap.forEach((d) => {
+    for (const r of pgDeliveredRes.rows) {
+      seenIds.add(r.id);
+      deliveredCount++;
+      if (r.partner_assigned_at && r.delivered_at) {
+        const dur = (new Date(r.delivered_at).getTime() - new Date(r.partner_assigned_at).getTime()) / 60000;
+        if (dur <= 30) onTimeCount++;
+      }
+    }
+
+    const ordersSnap = await withTimeout(
+      adminDb.collection('orders').where('deliveryPartnerId', '==', uid).where('status', '==', 'delivered').limit(200).get(),
+      'delivery.riderReportsRead',
+      1200
+    ).catch(() => null);
+
+    ordersSnap?.forEach((d: any) => {
+      if (seenIds.has(d.id)) return;
+      deliveredCount++;
       const o = d.data();
       const start = o.pickedUpAt ? new Date(o.pickedUpAt).getTime() : (o.partnerAssignedAt ? new Date(o.partnerAssignedAt).getTime() : null);
       const end = o.deliveredAt ? new Date(o.deliveredAt).getTime() : null;
       if (start && end) {
         const dur = (end - start) / (60 * 1000);
-        if (dur <= 30) onTimeCount++; // Target within 30 minutes
+        if (dur <= 30) onTimeCount++;
       }
       if (typeof o.riderRating === 'number' && o.riderRating > 0) {
         sumRating += o.riderRating;
@@ -880,6 +1006,7 @@ router.get('/rider/reports', requireRole(['delivery', 'delivery_partner', 'owner
       }
     });
 
+    const monthlyEarnings = deliveredCount * 40;
     const onTimeRate = deliveredCount > 0 ? Math.round((onTimeCount / deliveredCount) * 100) : 0;
     const averageRating = totalRated > 0 ? Number((sumRating / totalRated).toFixed(1)) : 5.0;
 

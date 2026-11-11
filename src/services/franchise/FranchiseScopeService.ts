@@ -68,10 +68,11 @@ export class FranchiseScopeService {
     const organizationId = user?.organizationId || this.DEFAULT_ORG_ID;
     const franchiseId = user?.franchiseId || (isGlobalOwner ? this.DEFAULT_FRANCHISE_ID : '');
     const branchId = user?.branchId || (isGlobalOwner ? this.DEFAULT_BRANCH_ID : '');
+    const defaultAliases = (b: string) => (b === 'main_branch' || b === 'branch_rjn_main') ? ['main_branch', 'branch_rjn_main'] : [b];
     const branchIds =
       user?.branchIds && Array.isArray(user.branchIds) && user.branchIds.length > 0
         ? user.branchIds
-        : (branchId ? [branchId] : []);
+        : (branchId ? defaultAliases(branchId) : []);
 
     const permissions = user?.permissions || [];
     const terminalId = user?.terminalId;
@@ -135,10 +136,14 @@ export class FranchiseScopeService {
     }
 
     // Branch-scoped staff must match targetBranchId explicitly (never allow wildcard 'all')
+    const matchesTarget = (bId: string) => 
+      bId === targetBranchId || 
+      ((bId === 'main_branch' || bId === 'branch_rjn_main') && (targetBranchId === 'main_branch' || targetBranchId === 'branch_rjn_main'));
+
     if (scope.branchIds && scope.branchIds.length > 0) {
-      return scope.branchIds.includes(targetBranchId);
+      return scope.branchIds.some(matchesTarget);
     }
-    return Boolean(scope.branchId && scope.branchId !== 'all' && scope.branchId === targetBranchId);
+    return Boolean(scope.branchId && scope.branchId !== 'all' && matchesTarget(scope.branchId));
   }
 
   /**
