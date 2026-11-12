@@ -1,0 +1,90 @@
+services:
+  - type: web
+    name: olive-pizza-backend
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: DATABASE_PROVIDER
+        value: layerbase
+      - key: DATABASE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_DIRECT_URL
+        sync: false
+      - key: LAYERBASE_DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_PASSWORD
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ASSISTANT_NVIDIA_API_KEY
+        sync: false
+      - key: ASSISTANT_OPENROUTER_API_KEY
+        sync: false
+      - key: ASSISTANT_GEMINI_API_KEY
+        sync: false
+      - key: STITCH_API_KEY
+        sync: false
+      - key: CLOUDFLARE_R2_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_R2_BUCKET_NAME
+        sync: false
+      - key: GOOGLE_SHEET_SPREADSHEET_ID
+        sync: false
+      - key: TRUECALLER_CLIENT_ID
+        sync: false
+      - key: TRUECALLER_PARTNER_KEY
+        sync: false
+      - key: TRUECALLER_APP_NAME
+        value: OlivePizza
+      - key: TRUECALLER_CALLBACK_URL
+        value: https://olive-pizza-backend.onrender.com/api/auth/truecaller/callback
+      - key: TRUECALLER_API_URL
+        value: https://api4.truecaller.com/v1/default
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: OWNER_EMAIL
+        value: webhub2811@gmail.com
+      - key: JWT_SECRET
+        generateValue: true
+      - key: TRACKING_TOKEN_SECRET
+        generateValue: true
+      - key: INTERNAL_RPC_SECRET
+        generateValue: true
+      - key: DEV_INTERNAL_RPC_SECRET
+        generateValue: true
+      - key: RENDER_PUBLIC_URL
+        value: https://olive-pizza-backend.onrender.com
+      - key: KEEP_ALIVE_ENABLED
+        value: true
