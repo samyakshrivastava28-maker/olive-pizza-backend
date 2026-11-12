@@ -74,6 +74,7 @@ import { PosAccountService } from '../services/auth/PosAccountService.js';
 import { PosPinService } from '../services/auth/PosPinService.js';
 import { PasswordResetWorkflowService } from '../services/auth/PasswordResetWorkflowService.js';
 import { AuthAuditService } from '../services/auth/AuthAuditService.js';
+import { query } from '../config/postgres.js';
 
 // ============================================================================
 // AUTHORIZE OPERATIONAL APP HANDSHAKE (POS, RESTAURANT_MANAGER, FRANCHISE_MANAGER, DELIVERY)
@@ -575,6 +576,374 @@ router.post('/email/signin', async (req: Request, res: Response): Promise<void> 
   } catch (err: any) {
     console.error('[AuthRoutes] Error in email signin:', err);
     res.status(500).json({ success: false, message: 'Failed to complete sign in. Please try again.' });
+  }
+});
+
+// ============================================================================
+// MANAGEMENT APPS PASSWORDLESS PRE-VERIFICATION & EMAIL CODE LOGIN
+// Replaces static email/password login and device lockouts across all 4 management apps
+// ============================================================================
+
+const eligibilityRateMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkEligibilityRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const rec = eligibilityRateMap.get(ip);
+  if (!rec || now > rec.resetAt) {
+    eligibilityRateMap.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    return true;
+  }
+  if (rec.count >= 20) {
+    return false;
+  }
+  rec.count++;
+  return true;
+}
+
+// POST /api/auth/management/check-eligibility
+router.post('/management/check-eligibility', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const clientIp = (req.ip || (req.headers['x-forwarded-for'] as string)?.split(',')[0] || '127.0.0.1').trim();
+    if (!checkEligibilityRateLimit(clientIp)) {
+      res.status(429).json({
+        success: false,
+        eligible: false,
+        message: 'Too many verification attempts from this network. Please wait a few minutes before trying again.'
+      });
+      return;
+    }
+
+    const { identifier, targetApp } = req.body;
+    if (!identifier || typeof identifier !== 'string') {
+      res.status(400).json({ success: false, eligible: false, message: 'Please provide a valid email or phone number.' });
+      return;
+    }
+
+    const cleanInput = identifier.trim();
+    const isEmail = cleanInput.includes('@');
+    const emailLower = isEmail ? cleanInput.toLowerCase() : '';
+    const phoneClean = !isEmail ? cleanInput.replace(/\D/g, '').slice(-10) : '';
+
+    const appKey = (targetApp || 'RESTAURANT_MANAGER').toUpperCase();
+
+    // 1. Check if user is Super Admin / Owner accounts
+    const isOwnerEmail = emailLower === 'webhub2811@gmail.com' || emailLower === 'olivepizzarjn@gmail.com';
+
+    let resolvedUser: any = null;
+
+    // 2. Query PostgreSQL app_users
+    try {
+      const pgRes = await query(
+        `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active
+         FROM app_users
+         WHERE ($1 <> '' AND LOWER(email) = LOWER($1))
+            OR ($2 <> '' AND phone IS NOT NULL AND RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $2)
+         LIMIT 1`,
+        [emailLower, phoneClean]
+      );
+      if (pgRes.rows.length > 0) {
+        resolvedUser = pgRes.rows[0];
+      }
+    } catch (pgErr) {
+      console.warn('[ManagementAuth] PostgreSQL query notice:', pgErr);
+    }
+
+    // 3. Fallback to Firestore users if not found in PostgreSQL
+    if (!resolvedUser && adminDb) {
+      try {
+        if (emailLower) {
+          const userSnap = await adminDb.collection('users').where('email', '==', emailLower).limit(1).get();
+          if (!userSnap.empty) {
+            resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
+          }
+        }
+        if (!resolvedUser && phoneClean) {
+          const userSnap = await adminDb.collection('users').where('phone', '==', phoneClean).limit(1).get();
+          if (!userSnap.empty) {
+            resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
+          }
+        }
+      } catch (fsErr) {
+        console.warn('[ManagementAuth] Firestore query notice:', fsErr);
+      }
+    }
+
+    // 4. If targetApp is DELIVERY, also check delivery_partners collection
+    if (!resolvedUser && appKey === 'DELIVERY' && adminDb) {
+      try {
+        if (emailLower) {
+          const riderSnap = await adminDb.collection('delivery_partners').where('email', '==', emailLower).limit(1).get();
+          if (!riderSnap.empty) {
+            resolvedUser = { ...riderSnap.docs[0].data(), id: riderSnap.docs[0].id, role: 'delivery_partner' };
+          }
+        }
+      } catch (rErr) {
+        console.warn('[ManagementAuth] delivery_partners check notice:', rErr);
+      }
+    }
+
+    // Special authorization rule for Owner / SuperAdmin
+    if (isOwnerEmail && !resolvedUser) {
+      resolvedUser = {
+        id: emailLower === 'webhub2811@gmail.com' ? '6tLLR6q7aTYqzTG2blRx3TU5sA42' : 'usr_owner_olive',
+        email: emailLower,
+        name: 'Olive Pizza Owner',
+        role: 'owner',
+        is_active: true,
+        franchise_id: 'fra_rajnandgaon',
+        branch_id: 'branch_rjn_main'
+      };
+    }
+
+    if (!resolvedUser) {
+      res.status(200).json({
+        success: false,
+        eligible: false,
+        message: 'No registered Olive Pizza management account found with this credential. Please contact Administration.'
+      });
+      return;
+    }
+
+    // Check account active state
+    if (resolvedUser.is_active === false || resolvedUser.status === 'SUSPENDED' || resolvedUser.status === 'DEACTIVATED') {
+      res.status(200).json({
+        success: false,
+        eligible: false,
+        message: 'This management account has been deactivated. Please contact Olive Pizza Administration.'
+      });
+      return;
+    }
+
+    const userRole = (resolvedUser.role || '').toLowerCase();
+    const isOwner = isOwnerEmail || userRole === 'owner' || userRole === 'admin' || userRole === 'developer';
+    const allowedApps = resolvedUser.allowed_apps || [];
+
+    // Verify app-specific eligibility
+    let isAppAuthorized = false;
+    if (isOwner) {
+      isAppAuthorized = true; // Owners have full unrestricted access to ALL 5 apps
+    } else {
+      switch (appKey) {
+        case 'RESTAURANT_MANAGER':
+          isAppAuthorized = ['restaurant_manager', 'manager', 'kitchen', 'owner', 'admin'].includes(userRole) || allowedApps.includes('RESTAURANT_MANAGER');
+          break;
+        case 'FRANCHISE_MANAGER':
+          isAppAuthorized = ['franchise_manager', 'franchise', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('FRANCHISE_MANAGER');
+          break;
+        case 'POS':
+          isAppAuthorized = ['cashier', 'pos', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('POS');
+          break;
+        case 'DELIVERY':
+          isAppAuthorized = ['delivery_partner', 'rider', 'owner', 'admin'].includes(userRole) || allowedApps.includes('DELIVERY');
+          break;
+        case 'OWNER':
+          isAppAuthorized = isOwner;
+          break;
+        default:
+          isAppAuthorized = false;
+      }
+    }
+
+    if (!isAppAuthorized) {
+      const appNames: Record<string, string> = {
+        RESTAURANT_MANAGER: 'Restaurant Manager',
+        FRANCHISE_MANAGER: 'Franchise Portal',
+        POS: 'POS Terminal',
+        DELIVERY: 'Delivery Raider',
+        OWNER: 'Owner Portal'
+      };
+      res.status(200).json({
+        success: false,
+        eligible: false,
+        message: `Your account (${resolvedUser.email || identifier}) is verified, but not authorized for ${appNames[appKey] || appKey}. Please contact Olive Pizza Administration.`
+      });
+      return;
+    }
+
+    const destinationEmail = (resolvedUser.email || emailLower).toLowerCase().trim();
+    if (!destinationEmail || !destinationEmail.includes('@')) {
+      res.status(400).json({
+        success: false,
+        eligible: false,
+        message: 'No verified email address is associated with this management account. Please contact Olive Pizza Administration.'
+      });
+      return;
+    }
+
+    // 5. Dispatch 6-digit temporary verification code to the verified email
+    const sendResult = await EmailVerificationService.sendVerificationCode(destinationEmail, clientIp, 6);
+    if (!sendResult.success) {
+      const status = sendResult.retryAfterSeconds ? 429 : 400;
+      res.status(status).json({
+        success: false,
+        eligible: true,
+        message: sendResult.message,
+        retryAfterSeconds: sendResult.retryAfterSeconds
+      });
+      return;
+    }
+
+    // Compute masked email for UI display (e.g. w***1@gmail.com)
+    const [localPart, domain] = destinationEmail.split('@');
+    const masked = localPart.length > 2 
+      ? `${localPart[0]}***${localPart[localPart.length - 1]}@${domain}`
+      : `${localPart[0]}***@${domain}`;
+
+    res.json({
+      success: true,
+      eligible: true,
+      email: destinationEmail,
+      maskedEmail: masked,
+      name: resolvedUser.name || destinationEmail.split('@')[0],
+      role: resolvedUser.role || (isOwner ? 'owner' : 'manager'),
+      targetApp: appKey,
+      message: 'Account verified! A 6-digit temporary verification code has been sent to your email.',
+      expiresInSeconds: 300,
+      demoCode: sendResult.demoCode
+    });
+  } catch (err: any) {
+    console.error('[ManagementAuth] check-eligibility error:', err);
+    res.status(500).json({ success: false, eligible: false, message: 'Internal authorization error. Please try again.' });
+  }
+});
+
+// POST /api/auth/management/verify-code-signin
+router.post('/management/verify-code-signin', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email, code, targetApp } = req.body;
+    if (!email || !code) {
+      res.status(400).json({ success: false, message: 'Email and 6-digit verification code are required.' });
+      return;
+    }
+
+    const cleanEmail = String(email).toLowerCase().trim();
+    const cleanCode = String(code).trim();
+    const clientIp = (req.ip || (req.headers['x-forwarded-for'] as string)?.split(',')[0] || '127.0.0.1').trim();
+    const appKey = (targetApp || 'RESTAURANT_MANAGER').toUpperCase();
+
+    // 1. Verify 6-digit temporary code
+    const verifyResult = await EmailVerificationService.verifyCode(cleanEmail, cleanCode, clientIp);
+    if (!verifyResult.success) {
+      res.status(400).json({ success: false, message: verifyResult.message });
+      return;
+    }
+
+    // 2. Resolve user record
+    const isOwnerEmail = cleanEmail === 'webhub2811@gmail.com' || cleanEmail === 'olivepizzarjn@gmail.com';
+    let resolvedUser: any = null;
+
+    try {
+      const pgRes = await query(
+        `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active
+         FROM app_users
+         WHERE LOWER(email) = LOWER($1)
+         LIMIT 1`,
+        [cleanEmail]
+      );
+      if (pgRes.rows.length > 0) {
+        resolvedUser = pgRes.rows[0];
+      }
+    } catch (e) {}
+
+    if (!resolvedUser && adminDb) {
+      const userSnap = await adminDb.collection('users').where('email', '==', cleanEmail).limit(1).get().catch(() => null);
+      if (userSnap && !userSnap.empty) {
+        resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
+      }
+    }
+
+    const userRole = (resolvedUser?.role || (isOwnerEmail ? 'owner' : 'manager')).toLowerCase();
+    const userName = resolvedUser?.name || cleanEmail.split('@')[0];
+    const branchId = resolvedUser?.branch_id || 'branch_rjn_main';
+    const franchiseId = resolvedUser?.franchise_id || 'fra_rajnandgaon';
+
+    // 3. Resolve or create Firebase Auth user
+    let uid: string;
+    try {
+      const userRecord = await adminAuth.getUserByEmail(cleanEmail);
+      uid = userRecord.uid;
+      if (!userRecord.emailVerified) {
+        await adminAuth.updateUser(uid, { emailVerified: true }).catch(() => {});
+      }
+    } catch (authErr: any) {
+      if (authErr.code === 'auth/user-not-found') {
+        const newUser = await adminAuth.createUser({
+          email: cleanEmail,
+          emailVerified: true,
+          displayName: userName,
+        });
+        uid = newUser.uid;
+      } else {
+        throw authErr;
+      }
+    }
+
+    // 4. Attach claims and generate custom token
+    const claims = {
+      role: userRole,
+      targetApp: appKey,
+      branchId,
+      franchiseId,
+      isOwnerMode: isOwnerEmail || userRole === 'owner'
+    };
+    await adminAuth.setCustomUserClaims(uid, claims).catch(() => {});
+
+    const customToken = await adminAuth.createCustomToken(uid, claims);
+
+    // 5. Update user record in Firestore
+    if (adminDb) {
+      await adminDb.collection('users').doc(uid).set({
+        email: cleanEmail,
+        name: userName,
+        role: userRole,
+        branchId,
+        franchiseId,
+        lastLoginAt: new Date().toISOString(),
+        emailVerified: true,
+        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+      }, { merge: true }).catch(() => {});
+    }
+
+    res.json({
+      success: true,
+      customToken,
+      user: {
+        uid,
+        email: cleanEmail,
+        name: userName,
+        role: userRole,
+        branchId,
+        branchName: 'Olive Pizza — Rajnandgaon HQ',
+        franchiseId,
+        permissions: ['*'],
+        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+      }
+    });
+  } catch (err: any) {
+    console.error('[ManagementAuth] verify-code-signin error:', err);
+    res.status(500).json({ success: false, message: 'Failed to complete sign in. Please try again.' });
+  }
+});
+
+// POST /api/auth/management/resend-code
+router.post('/management/resend-code', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      res.status(400).json({ success: false, message: 'Email address is required.' });
+      return;
+    }
+    const cleanEmail = String(email).toLowerCase().trim();
+    const clientIp = (req.ip || (req.headers['x-forwarded-for'] as string)?.split(',')[0] || '127.0.0.1').trim();
+    const result = await EmailVerificationService.sendVerificationCode(cleanEmail, clientIp, 6);
+    if (!result.success) {
+      const status = result.retryAfterSeconds ? 429 : 400;
+      res.status(status).json(result);
+      return;
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Failed to resend verification code.' });
   }
 });
 

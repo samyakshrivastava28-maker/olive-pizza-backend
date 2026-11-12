@@ -41,9 +41,9 @@ export class EmailVerificationService {
   }
 
   /**
-   * Request a 4-digit verification code sent to the specified email address.
+   * Request a 4 to 6-digit verification code sent to the specified email address.
    */
-  public static async sendVerificationCode(email: string, ipAddress: string = '127.0.0.1'): Promise<VerificationSendResult> {
+  public static async sendVerificationCode(email: string, ipAddress: string = '127.0.0.1', digits: number = 6): Promise<VerificationSendResult> {
     if (!email || !email.includes('@')) {
       return { success: false, message: 'A valid email address is required.' };
     }
@@ -86,8 +86,10 @@ export class EmailVerificationService {
       }
     }
 
-    // Generate cryptographically secure 4-digit code (1000 to 9999)
-    const codeNumber = crypto.randomInt(1000, 10000);
+    // Generate cryptographically secure code (4 to 6 digits)
+    const minVal = digits === 4 ? 1000 : 100000;
+    const maxVal = digits === 4 ? 10000 : 1000000;
+    const codeNumber = crypto.randomInt(minVal, maxVal);
     const code = codeNumber.toString();
     const salt = crypto.randomBytes(16).toString('hex');
     const codeHash = this.hashCode(code, salt);
@@ -114,17 +116,17 @@ export class EmailVerificationService {
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #f0f0f0; box-shadow: 0 4px 20px rgba(0,0,0,0.05);">
         <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); padding: 32px 24px; text-align: center;">
           <h1 style="color: #ffffff; margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.5px;">OLIVE PIZZA</h1>
-          <p style="color: #d1fae5; margin: 6px 0 0 0; font-size: 14px; font-weight: 500;">Security Verification Code</p>
+          <p style="color: #d1fae5; margin: 6px 0 0 0; font-size: 14px; font-weight: 500;">Management Security Code</p>
         </div>
         <div style="padding: 32px 28px;">
           <p style="color: #374151; font-size: 15px; line-height: 22px; margin: 0 0 20px 0;">
             Hello,
           </p>
           <p style="color: #374151; font-size: 15px; line-height: 22px; margin: 0 0 24px 0;">
-            Use the following 4-digit security code to complete your verification with Olive Pizza. This code is confidential and valid for <strong>5 minutes</strong>.
+            Use the following ${digits}-digit security code to verify and access your Olive Pizza management account. This temporary code is valid for <strong>5 minutes</strong>.
           </p>
           <div style="background: #f3f4f6; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px;">
-            <span style="font-family: monospace; font-size: 38px; font-weight: 900; letter-spacing: 12px; color: #059669; display: inline-block; margin-left: 12px;">
+            <span style="font-family: monospace; font-size: 36px; font-weight: 900; letter-spacing: 8px; color: #059669; display: inline-block; margin-left: 8px;">
               ${code}
             </span>
           </div>
@@ -134,7 +136,7 @@ export class EmailVerificationService {
             </p>
           </div>
           <p style="color: #9ca3af; font-size: 12px; margin: 0; line-height: 18px; text-align: center;">
-            If you did not request this verification, you can safely ignore this email.
+            If you did not request this login verification, you can safely ignore this email.
           </p>
         </div>
         <div style="background: #f9fafb; padding: 16px 24px; text-align: center; border-top: 1px solid #f3f4f6;">
@@ -146,13 +148,13 @@ export class EmailVerificationService {
     `;
 
     // Dispatch email asynchronously using high-speed pooled SMTP queue (matching order emails)
-    queueEmail(cleanEmail, 'Your Olive Pizza 4-Digit Verification Code', emailHtml, 'auth')
+    queueEmail(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml, 'auth')
       .then((queueId) => {
         console.log(`[EmailVerificationService] ✅ Verification email queued for ${cleanEmail} (ID: ${queueId})`);
       })
       .catch((err: any) => {
         console.warn(`[EmailVerificationService] Queue error, using direct pooled SMTP send:`, err?.message);
-        sendEmailDirect(cleanEmail, 'Your Olive Pizza 4-Digit Verification Code', emailHtml)
+        sendEmailDirect(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml)
           .then(() => console.log(`[EmailVerificationService] ✅ Verification email delivered directly via SMTP to ${cleanEmail}`))
           .catch((directErr: any) => console.error('[EmailVerificationService] ❌ Failed to dispatch email via SMTP:', directErr?.message || directErr));
       });
@@ -163,7 +165,7 @@ export class EmailVerificationService {
       identifier: cleanEmail,
       ipAddress,
       status: 'SUCCESS',
-      metadata: { expiresInSeconds: 300, backgroundDispatched: true },
+      metadata: { expiresInSeconds: 300, digits, backgroundDispatched: true },
     }).catch(() => {});
 
     const isDevelopment = process.env.NODE_ENV !== 'production' || process.env.PHONE_AUTH_MODE === 'development';
@@ -176,18 +178,18 @@ export class EmailVerificationService {
   }
 
   /**
-   * Verify the 4-digit code provided by the user.
+   * Verify the 4 to 6-digit code provided by the user.
    */
   public static async verifyCode(email: string, code: string, ipAddress: string = '127.0.0.1'): Promise<VerificationCheckResult> {
     if (!email || !code) {
-      return { success: false, message: 'Email and 4-digit code are required.' };
+      return { success: false, message: 'Email and verification code are required.' };
     }
 
     const cleanEmail = email.toLowerCase().trim();
     const cleanCode = code.toString().trim();
 
-    if (!/^\d{4}$/.test(cleanCode)) {
-      return { success: false, message: 'Verification code must be exactly 4 digits.' };
+    if (!/^\d{4,6}$/.test(cleanCode)) {
+      return { success: false, message: 'Verification code must be 4 to 6 digits.' };
     }
 
     if (!adminDb) {
