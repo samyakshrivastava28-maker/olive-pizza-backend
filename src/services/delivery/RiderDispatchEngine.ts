@@ -119,6 +119,7 @@ export class RiderDispatchEngine {
     }
 
     // 5. Fallback: Check online delivery partners at this branch even if GPS breadcrumb hasn't emitted yet
+    // Strictly requires is_online = true AND fresh activity/location timestamp within last 15 minutes
     try {
       let partnerSql = `
         SELECT id AS uid, name, phone, branch_id, franchise_id, current_lat, current_lng, is_online, active_order_id
@@ -127,6 +128,7 @@ export class RiderDispatchEngine {
           AND status = 'APPROVED'
           AND is_online = true
           AND (active_order_id IS NULL OR active_order_id = '')
+          AND (last_location_time >= NOW() - INTERVAL '15 minutes' OR updated_at >= NOW() - INTERVAL '15 minutes')
       `;
       const partnerParams: any[] = [branchId];
       if (franchiseId) {
@@ -155,7 +157,7 @@ export class RiderDispatchEngine {
       console.warn('[RiderDispatchEngine] PostgreSQL fallback partner discovery notice:', e.message);
     }
 
-    // 6. Transitional Firestore fallback for unmigrated riders (bounded so Spark quota never stalls dispatch)
+    // 6. Transitional Firestore fallback for unmigrated riders (strictly requires online + recent heartbeat)
     try {
       const ridersMap = new Map<string, any>();
       const ridersSnap = await withTimeout(
@@ -177,14 +179,20 @@ export class RiderDispatchEngine {
       });
 
       const fsCandidates: EligibleRider[] = [];
+      const nowMs = Date.now();
       for (const [uid, rData] of ridersMap.entries()) {
         if (excludedUids.has(uid)) continue;
         const riderBranch = (rData.branchId || '').trim();
         const riderFranchise = (rData.franchiseId || '').trim();
         if (riderBranch !== branchId) continue;
         if (franchiseId && riderFranchise && riderFranchise !== franchiseId) continue;
-        if (rData.isOnline === false || rData.isActive === false || rData.isDisabled === true) continue;
+        if (rData.isOnline !== true || rData.isActive === false || rData.isDisabled === true) continue;
         if (rData.activeOrderId && rData.activeOrderId !== orderId) continue;
+
+        const lastUp = rData.lastLocationUpdate || rData.onlineStatusUpdatedAt || rData.updatedAt;
+        if (!lastUp) continue;
+        const lastMs = new Date(lastUp).getTime();
+        if (isNaN(lastMs) || nowMs - lastMs > 15 * 60 * 1000) continue; // Must have recent activity
 
         fsCandidates.push({
           uid,

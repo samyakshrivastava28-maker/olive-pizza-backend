@@ -1181,10 +1181,10 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
       const custLng = rawLng != null ? Number(rawLng) : NaN;
 
       if (deliveryType === 'delivery') {
-        if (isNaN(custLat) || isNaN(custLng)) {
+        if (isNaN(custLat) || isNaN(custLng) || !userAddress || userAddress.trim().length < 5) {
           res.status(400).json({
-            error: "We currently don't deliver to this location.",
-            code: 'OUT_OF_DELIVERY_ZONE'
+            error: "A valid verified delivery address and location coordinates are required to place an order.",
+            code: 'LOCATION_REQUIRED'
           });
           return;
         }
@@ -1696,7 +1696,17 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
 
       // Verify captured online payment in PostgreSQL ledger before order confirmation
       let initialPaymentStatus = 'PENDING';
-      const rawPaymentMethod = (req.body.paymentMethod || 'COD').toUpperCase();
+      const rawPaymentMethod = (req.body.paymentMethod || '').trim().toUpperCase();
+
+      if (resolvedOrderSource === 'ONLINE') {
+        if (!rawPaymentMethod || !['COD', 'UPI', 'CARD', 'WALLET', 'ONLINE'].includes(rawPaymentMethod)) {
+          res.status(400).json({
+            error: 'Please select a valid payment method (UPI, Cards, or Cash on Delivery) to place your order.',
+            code: 'PAYMENT_METHOD_REQUIRED'
+          });
+          return;
+        }
+      }
 
       if (resolvedOrderSource !== 'ONLINE') {
         // Authoritative verification for POS payments against canonical records

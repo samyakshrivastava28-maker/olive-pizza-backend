@@ -82,17 +82,17 @@ const ROLE_AUTHORITY: Record<string, StateMachineActorRole[]> = {
   'partner_assigned->ready':    ['restaurant_manager', 'kitchen_staff', 'cashier', 'system'],
   'partner_assigned->picked_up': ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
   'partner_assigned->out_for_delivery': ['delivery_partner', 'restaurant_manager', 'system'],
-  'partner_assigned->delivered': ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
+  'partner_assigned->delivered': ['delivery_partner', 'system'],
   'partner_assigned->cancelled': ['restaurant_manager', 'cashier', 'system'],
   'ready->partner_assigned':    ['restaurant_manager', 'cashier', 'system'],
   'ready->picked_up':           ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
   'ready->out_for_delivery':    ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
-  'ready->delivered':           ['restaurant_manager', 'cashier', 'kitchen_staff', 'system'],
+  'ready->delivered':           ['restaurant_manager', 'cashier', 'kitchen_staff', 'system'], // Pickup/takeaway only
   'ready->cancelled':           ['restaurant_manager', 'cashier', 'system'],
   'picked_up->out_for_delivery': ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
   'picked_up->delivered':       ['delivery_partner', 'system'],
   'picked_up->delivery_failed': ['delivery_partner', 'restaurant_manager', 'system'],
-  'out_for_delivery->delivered': ['delivery_partner', 'restaurant_manager', 'cashier', 'system'],
+  'out_for_delivery->delivered': ['delivery_partner', 'system'], // Delivery rider only (or system)
   'out_for_delivery->delivery_failed': ['delivery_partner', 'restaurant_manager', 'system'],
   'delivery_failed->returned_to_branch': ['restaurant_manager', 'cashier', 'system'],
   'returned_to_branch->cancelled': ['restaurant_manager', 'owner', 'system'],
@@ -551,17 +551,12 @@ export class OrderStateMachine {
         }
 
         case 'delivered': {
-          // 1. Mandatory 50-metre Delivery Location Gate
-          const fulfillment = (orderData.fulfillmentType || orderData.deliveryType || 'delivery').toLowerCase();
-          if (fulfillment === 'delivery' && normalizedActorRole === 'delivery_partner') {
-            const { GeofenceVerificationService } = await import('../delivery/GeofenceVerificationService.js');
-            const geofenceResult = await GeofenceVerificationService.verifyRiderProximity(
-              orderId,
-              actor.uid,
-              orderData,
-              metadata.clientCoordinates
-            );
-            if (!geofenceResult.allowed) {
+          const fulfillment = (orderData.fulfillmentType || orderData.deliveryType || orderData.order_type || 'delivery').toLowerCase();
+
+          // 1. Strict Completion Authority & Delivery Geofence Gate
+          if (fulfillment === 'delivery') {
+            // Delivery orders can ONLY be marked as delivered by the assigned delivery partner (or system)
+            if (normalizedActorRole !== 'delivery_partner' && normalizedActorRole !== 'system') {
               if (client) await client.query('ROLLBACK').catch(() => {});
               return {
                 success: false,
@@ -569,7 +564,42 @@ export class OrderStateMachine {
                 previousStatus: fromState,
                 currentStatus: fromState,
                 version: orderData.notification_version || 1,
-                error: `50-metre delivery gate violated: ${geofenceResult.reason || 'Rider is outside the 50m customer delivery radius.'}`,
+                error: 'Restaurant staff cannot mark delivery orders as delivered. Delivery orders must be completed by the assigned delivery rider at the customer delivery location.',
+              };
+            }
+
+            // Mandatory 50-metre Delivery Location Gate for delivery partner
+            if (normalizedActorRole === 'delivery_partner') {
+              const { GeofenceVerificationService } = await import('../delivery/GeofenceVerificationService.js');
+              const geofenceResult = await GeofenceVerificationService.verifyRiderProximity(
+                orderId,
+                actor.uid,
+                orderData,
+                metadata.clientCoordinates
+              );
+              if (!geofenceResult.allowed) {
+                if (client) await client.query('ROLLBACK').catch(() => {});
+                return {
+                  success: false,
+                  orderId,
+                  previousStatus: fromState,
+                  currentStatus: fromState,
+                  version: orderData.notification_version || 1,
+                  error: `50-metre delivery gate violated: ${geofenceResult.reason || 'Rider is outside the 50m customer delivery radius.'}`,
+                };
+              }
+            }
+          } else {
+            // Pickup / Takeaway / Dine-in: Can only be completed by restaurant staff or system
+            if (!['restaurant_manager', 'cashier', 'kitchen_staff', 'system'].includes(normalizedActorRole)) {
+              if (client) await client.query('ROLLBACK').catch(() => {});
+              return {
+                success: false,
+                orderId,
+                previousStatus: fromState,
+                currentStatus: fromState,
+                version: orderData.notification_version || 1,
+                error: 'Pickup orders can only be marked as completed by restaurant staff.',
               };
             }
           }
