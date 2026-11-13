@@ -203,9 +203,14 @@ export class FranchiseScopeService {
   public static assertOrderAccess(scope: ScopeContext, orderData: any, callerUid: string): void {
     if (scope.isGlobalOwner) return;
 
-    // Customer can only access their own order
+    // Customer who placed this order can always access their own order regardless of their role/account type
+    const orderCustomerUid = orderData.userId || orderData.customerId || orderData.firebaseUid || orderData.customerFirebaseUid;
+    if (callerUid && orderCustomerUid && orderCustomerUid === callerUid) {
+      return;
+    }
+
+    // Customer role can only access their own order
     if (scope.role === 'customer') {
-      const orderCustomerUid = orderData.userId || orderData.firebaseUid || orderData.customerFirebaseUid;
       if (orderCustomerUid && orderCustomerUid !== callerUid) {
         const error: any = new Error('Forbidden: You do not own this order');
         error.status = 403;

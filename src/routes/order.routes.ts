@@ -548,8 +548,19 @@ router.get('/bill/:billReference', verifyToken, async (req: AuthRequest, res: Re
     const orderNumber = orderDoc.orderNumber || `#${dailyOrderNumber}`;
 
     const createdDate = orderDoc.createdAt?.toDate ? orderDoc.createdAt.toDate() : new Date(orderDoc.createdAt || Date.now());
-    const orderDate = orderDoc.orderDateLocal || BillingNumberService.getLocalDateString(createdDate);
-    const orderTime = BillingNumberService.getLocalTimeString(createdDate);
+    let orderDate = '';
+    if (typeof orderDoc.orderDateLocal === 'string' && orderDoc.orderDateLocal.length > 0) {
+      orderDate = orderDoc.orderDateLocal;
+    } else if (orderDoc.orderDateLocal && typeof orderDoc.orderDateLocal.toDate === 'function') {
+      orderDate = BillingNumberService.getLocalDateString(orderDoc.orderDateLocal.toDate());
+    } else if (orderDoc.orderDateLocal && typeof (orderDoc.orderDateLocal as any)._seconds === 'number') {
+      orderDate = BillingNumberService.getLocalDateString(new Date((orderDoc.orderDateLocal as any)._seconds * 1000));
+    } else {
+      orderDate = BillingNumberService.getLocalDateString(createdDate);
+    }
+    const orderTime = (typeof orderDoc.orderTimeLocal === 'string' && orderDoc.orderTimeLocal.length > 0)
+      ? orderDoc.orderTimeLocal
+      : BillingNumberService.getLocalTimeString(createdDate);
 
     const orderType = (orderDoc.fulfillmentType || orderDoc.deliveryType || orderDoc.orderType || 'delivery').toLowerCase();
     const orderTypeLabel = orderType === 'pickup' || orderType === 'takeaway' ? 'Pickup / Takeaway' : 'Home Delivery';

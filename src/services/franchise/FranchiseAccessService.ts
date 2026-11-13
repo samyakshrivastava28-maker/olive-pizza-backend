@@ -762,29 +762,31 @@ export class FranchiseAccessService {
         );
 
         if (riderRes.rows.length === 0) {
-          return {
-            authorized: false,
-            code: 'DELIVERY_ASSIGNMENT_REQUIRED',
-            reason: 'No delivery partner fleet record is linked to this authenticated account.'
-          };
-        }
+          if (!isOwner) {
+            return {
+              authorized: false,
+              code: 'DELIVERY_ASSIGNMENT_REQUIRED',
+              reason: 'No delivery partner fleet record is linked to this authenticated account.'
+            };
+          }
+        } else {
+          deliveryPartnerRecord = riderRes.rows[0];
 
-        deliveryPartnerRecord = riderRes.rows[0];
+          if (['REVOKED', 'TERMINATED', 'DISABLED'].includes(deliveryPartnerRecord.status)) {
+            return {
+              authorized: false,
+              code: 'ACCOUNT_REVOKED',
+              reason: 'Delivery partner account has been revoked or disabled in the fleet database.'
+            };
+          }
 
-        if (['REVOKED', 'TERMINATED', 'DISABLED'].includes(deliveryPartnerRecord.status)) {
-          return {
-            authorized: false,
-            code: 'ACCOUNT_REVOKED',
-            reason: 'Delivery partner account has been revoked or disabled in the fleet database.'
-          };
-        }
-
-        if (deliveryPartnerRecord.status !== 'APPROVED') {
-          return {
-            authorized: false,
-            code: 'NOT_APPROVED',
-            reason: 'Your delivery partner account is not active or approved.'
-          };
+          if (deliveryPartnerRecord.status !== 'APPROVED') {
+            return {
+              authorized: false,
+              code: 'NOT_APPROVED',
+              reason: 'Your delivery partner account is not active or approved.'
+            };
+          }
         }
       } catch (riderErr: any) {
         console.error('[FranchiseAccessService] PostgreSQL delivery_partners lookup failure (fail-closed):', riderErr.message);
@@ -833,16 +835,9 @@ export class FranchiseAccessService {
         }
       }
     } else {
-      // Strict Single-App Policy (A1): Owner accounts ONLY access OWNER portal (or Customer consumer portal),
-      // never operational management portals (POS, Restaurant Manager, Franchise Manager, Delivery).
-      if (['POS', 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'DELIVERY'].includes(targetApp)) {
-        return {
-          authorized: false,
-          code: 'OWNER_PORTAL_ONLY',
-          reason: `Owner accounts cannot log into ${targetApp}. Use a dedicated branch/franchise staff account, or view all franchises in the Owner Portal.`
-        };
-      }
-      if (requestedBranchId) {
+      // Owner and authorized internal accounts have full administrative authority across all operational portals
+      // (POS, Restaurant Manager, Franchise Manager, Delivery, Owner).
+      if (requestedBranchId && requestedBranchId !== 'all') {
         resolvedBranch = requestedBranchId;
       } else if (!resolvedBranch) {
         resolvedBranch = 'main_branch';

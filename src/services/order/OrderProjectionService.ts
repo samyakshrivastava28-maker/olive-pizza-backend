@@ -660,6 +660,13 @@ export class OrderProjectionService {
     if (role === 'owner' || isMasterOwner || role === 'developer' || role === 'admin' || role === 'platform_owner') {
       return this.projectForOwner(order);
     }
+
+    // If caller is the customer who placed this order, project for Customer
+    const orderCustUid = order.userId || order.customerId || order.firebaseUid || order.customerFirebaseUid;
+    if (user?.uid && orderCustUid && orderCustUid === user.uid) {
+      return this.projectForCustomer(order, user.uid);
+    }
+
     if (role === 'restaurant_manager' || role === 'manager' || role === 'kitchen_staff') {
       return this.projectForRestaurantManager(order);
     }

@@ -246,17 +246,29 @@ export class AuthoritativePricingResolver {
     // 4. Resolve crust pricing & validate crust
     let crustPrice = 0;
     const selectedCrust = (req.crust || '').toLowerCase().trim();
-    const isDefaultCrust = ['classic', 'normal', 'regular', 'default', ''].includes(selectedCrust);
+    const isDefaultCrust = [
+      'classic',
+      'classic crust',
+      'classic hand tossed',
+      'hand tossed',
+      'normal',
+      'normal crust',
+      'regular',
+      'regular crust',
+      'pan',
+      'pan crust',
+      'standard',
+      'default',
+      ''
+    ].includes(selectedCrust);
 
     if (selectedCrust && !isDefaultCrust) {
       if (!Array.isArray(masterItem.crusts) || masterItem.crusts.length === 0) {
         throw new Error(`Invalid crust "${req.crust}" requested: product "${productName}" does not offer custom crusts.`);
       }
       const c = masterItem.crusts.find((cr: any) => {
-        if (typeof cr === 'string') {
-          return cr.toLowerCase().includes(selectedCrust);
-        }
-        return (cr.name || cr.id || '').toLowerCase() === selectedCrust;
+        const crStr = (typeof cr === 'string' ? cr : (cr.name || cr.id || '')).toLowerCase().trim();
+        return crStr.includes(selectedCrust) || selectedCrust.includes(crStr);
       });
       if (!c) {
         throw new Error(`Invalid crust "${req.crust}" requested for product "${productName}".`);
@@ -268,10 +280,8 @@ export class AuthoritativePricingResolver {
       }
     } else if (isDefaultCrust && Array.isArray(masterItem.crusts)) {
       const c = masterItem.crusts.find((cr: any) => {
-        if (typeof cr === 'string') {
-          return cr.toLowerCase().includes(selectedCrust);
-        }
-        return (cr.name || cr.id || '').toLowerCase() === selectedCrust;
+        const crStr = (typeof cr === 'string' ? cr : (cr.name || cr.id || '')).toLowerCase().trim();
+        return crStr.includes(selectedCrust) || selectedCrust.includes(crStr);
       });
       if (c && typeof c === 'object') {
         crustPrice = Math.max(0, Number(c.price || 0));

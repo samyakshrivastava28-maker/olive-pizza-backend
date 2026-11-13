@@ -579,7 +579,7 @@ export class OrderStateMachine {
           const isCod = paymentMethod === 'cod' || orderData.isCod === true;
           if (isCod) {
             let isPaid = orderData.isPaid === true || ['PAID', 'COLLECTED'].includes((orderData.paymentStatus || '').toUpperCase());
-            if (!isPaid && (metadata.paymentCollected === true || metadata.paymentStatus === 'PAID' || metadata.paymentStatus === 'COLLECTED')) {
+            if (!isPaid && (metadata.paymentCollected === true || metadata.paymentStatus === 'PAID' || metadata.paymentStatus === 'COLLECTED' || ['restaurant_manager', 'cashier', 'owner', 'platform_owner', 'developer'].includes(normalizedActorRole))) {
               isPaid = true;
               updates.paymentStatus = 'PAID';
               updates.paymentCollectedAt = nowIso;

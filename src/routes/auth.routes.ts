@@ -442,7 +442,7 @@ router.post('/email/send-code', async (req: Request, res: Response): Promise<voi
       return;
     }
     const clientIp = (req.ip || (req.headers['x-forwarded-for'] as string)?.split(',')[0] || '127.0.0.1').trim();
-    const result = await EmailVerificationService.sendVerificationCode(email, clientIp);
+    const result = await EmailVerificationService.sendVerificationCode(email, clientIp, 4);
 
     if (!result.success) {
       const status = result.retryAfterSeconds ? 429 : 400;
