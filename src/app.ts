@@ -305,29 +305,26 @@ app.use('/', seoRoutes);
 app.use('/api', seoRoutes);
 
 // ─── RATE LIMITING TIER ATTACHMENTS ──────────────────────────────────────────
-app.use('/auth', authLimiter);
-app.use('/phone', authLimiter);
-app.use('/phone/send-otp', otpLimiter, verifyTurnstile);
-app.use('/api/phone/send-otp', otpLimiter, verifyTurnstile);
+app.use(['/auth', '/api/auth'], authLimiter);
+app.use(['/phone', '/api/phone'], authLimiter);
+app.use(['/phone/send-otp', '/api/phone/send-otp'], otpLimiter, verifyTurnstile);
 
-app.use('/menu', publicLimiter);
-app.use('/seo', publicLimiter);
+app.use(['/menu', '/api/menu'], publicLimiter);
+app.use(['/seo', '/api/seo'], publicLimiter);
 
-app.use('/orders', userLimiter);
-app.use('/users', userLimiter);
-app.use('/tracking', userLimiter);
+app.use(['/orders', '/api/orders', '/api/order'], userLimiter);
+app.use(['/users', '/api/users'], userLimiter);
+app.use(['/tracking', '/api/tracking', '/api/v1/tracking'], userLimiter);
 
-app.use('/admin', adminLimiter);
-app.use('/delivery', adminLimiter);
-app.use('/data-manager', adminLimiter);
+app.use(['/admin', '/api/admin'], adminLimiter);
+app.use(['/delivery', '/api/delivery'], adminLimiter);
+app.use(['/data-manager', '/api/data-manager'], adminLimiter);
 
-app.use('/ai', expensiveLimiter);
-app.use('/api/ai', expensiveLimiter);
-app.use('/reports', expensiveLimiter);
-app.use('/google-drive', expensiveLimiter);
-app.use('/notifications/send-custom', expensiveLimiter);
-app.use('/tts', expensiveLimiter);
-app.use('/api/tts', expensiveLimiter);
+app.use(['/ai', '/api/ai'], expensiveLimiter);
+app.use(['/reports', '/api/reports'], expensiveLimiter);
+app.use(['/google-drive', '/api/google-drive'], expensiveLimiter);
+app.use(['/notifications/send-custom', '/api/notifications/send-custom'], expensiveLimiter);
+app.use(['/tts', '/api/tts'], expensiveLimiter);
 
 import emailRoutes from './routes/email.routes.js';
 import googleDriveRoutes from './routes/googleDrive.routes.js';
