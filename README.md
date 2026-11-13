@@ -1,4 +1,4 @@
-# Olive Pizza — Authoritative Backend API (v2.2.0)
+# Olive Pizza — Authoritative Backend API (v2.3.0)
 
 Production-grade, highly resilient backend engine for **Olive Pizza**, powering the entire multi-tenant franchise ecosystem: Customer Web & Mobile apps, Owner Dashboard, Franchise Portals, Restaurant Manager (KDS/Operations), Delivery Raider apps, and POS Billing Terminals.
 
