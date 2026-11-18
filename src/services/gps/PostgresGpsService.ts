@@ -557,7 +557,7 @@ export class PostgresGpsService {
     let filterFranchiseClause = '';
     if (franchiseId) {
       queryParams.push(franchiseId);
-      filterFranchiseClause = ` AND p.franchise_id = $${queryParams.length}`;
+      filterFranchiseClause = ` AND (p.franchise_id = $${queryParams.length} OR (p.franchise_id IN ('fra_primary', 'fra_rajnandgaon') AND $${queryParams.length} IN ('fra_primary', 'fra_rajnandgaon')))`;
     }
 
     let excludeClause = '';
@@ -584,7 +584,7 @@ export class PostgresGpsService {
              )::numeric, 0) AS distance_meters
       FROM delivery_partners p
       JOIN delivery_locations l ON l.delivery_partner_id = p.id
-      WHERE p.branch_id = $1
+      WHERE (p.branch_id = $1 OR (p.branch_id IN ('main_branch', 'branch_rjn_main') AND $1 IN ('main_branch', 'branch_rjn_main')))
         ${filterFranchiseClause}
         ${excludeClause}
         AND p.status = 'APPROVED'

@@ -1,11 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { adminDb, adminAuth } from '../config/firebase.js';
+import { query } from '../config/postgres.js';
 import { verifyToken, requireRole, AuthRequest } from '../middleware/auth.middleware.js';
 
 const router = Router();
 
 router.use(verifyToken);
-router.use(requireRole(['owner', 'admin']));
+router.use(requireRole(['owner', 'admin', 'developer', 'platform_owner']));
 
 // ─── Field Whitelisting Helpers ──────────────────────────────────────────────
 function filterProductFields(body: any) {
@@ -350,20 +351,129 @@ router.get('/accounts/pending', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// GET /accounts - List all operational accounts
-router.get('/accounts', async (req: AuthRequest, res: Response) => {
+// GET /accounts - List and search all operational and customer accounts (Authoritative PostgreSQL + Firestore)
+router.get(['/accounts', '/accounts/search'], async (req: AuthRequest, res: Response) => {
   try {
+    const { search, role, status, branchId, franchiseId, limit = 100, offset = 0 } = req.query;
     const accounts: any[] = [];
+    const seenEmails = new Set<string>();
     const seenUids = new Set<string>();
 
-    // 1. Restaurant Managers
+    // 1. Authoritative PostgreSQL Database Search (app_users table)
+    try {
+      const conditions: string[] = [];
+      const params: any[] = [];
+      let paramIdx = 1;
+
+      if (search && typeof search === 'string' && search.trim()) {
+        conditions.push(`(name ILIKE $${paramIdx} OR email ILIKE $${paramIdx} OR phone ILIKE $${paramIdx})`);
+        params.push(`%${search.trim()}%`);
+        paramIdx++;
+      }
+      if (role && typeof role === 'string' && role.trim()) {
+        conditions.push(`role = $${paramIdx}`);
+        params.push(role.trim());
+        paramIdx++;
+      }
+      if (status && typeof status === 'string' && status.trim()) {
+        conditions.push(`status = $${paramIdx}`);
+        params.push(status.trim());
+        paramIdx++;
+      }
+      if (branchId && typeof branchId === 'string' && branchId.trim()) {
+        conditions.push(`branch_id = $${paramIdx}`);
+        params.push(branchId.trim());
+        paramIdx++;
+      }
+      if (franchiseId && typeof franchiseId === 'string' && franchiseId.trim()) {
+        conditions.push(`franchise_id = $${paramIdx}`);
+        params.push(franchiseId.trim());
+        paramIdx++;
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      params.push(Number(limit) || 100);
+      params.push(Number(offset) || 0);
+
+      const pgRes = await query(
+        `SELECT id, email, phone, name, role, status, is_active, franchise_id, branch_id, allowed_apps, metadata, created_at, updated_at
+         FROM app_users
+         ${whereClause}
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+        params
+      );
+
+      for (const row of pgRes.rows) {
+        const emailLower = (row.email || '').toLowerCase().trim();
+        if (emailLower) seenEmails.add(emailLower);
+        seenUids.add(row.id);
+
+        const targetApp = (
+          row.role === 'restaurant_manager' ? 'RESTAURANT_MANAGER' :
+          row.role === 'pos_operator' || row.role === 'cashier' ? 'POS' :
+          row.role === 'franchise_manager' || row.role === 'franchise_owner' ? 'FRANCHISE_MANAGER' :
+          row.role === 'delivery_partner' || row.role === 'rider' ? 'DELIVERY' :
+          row.role === 'owner' || row.role === 'admin' || row.role === 'developer' || row.role === 'platform_owner' ? 'OWNER' : 'CUSTOMER'
+        );
+
+        const appLabel = (
+          targetApp === 'RESTAURANT_MANAGER' ? 'Restaurant Management' :
+          targetApp === 'POS' ? 'POS Terminal' :
+          targetApp === 'FRANCHISE_MANAGER' ? 'Franchise Management' :
+          targetApp === 'DELIVERY' ? 'Delivery Rider' :
+          targetApp === 'OWNER' ? 'Owner / Admin' : 'Customer App'
+        );
+
+        accounts.push({
+          id: row.id,
+          uid: row.id,
+          name: row.name || emailLower.split('@')[0] || 'User',
+          email: row.email || '',
+          phone: row.phone || '',
+          role: row.role,
+          targetApp,
+          appLabel,
+          franchiseId: row.franchise_id || '',
+          branchId: row.branch_id || '',
+          status: row.status || (row.is_active ? 'APPROVED' : 'DISABLED'),
+          isActive: Boolean(row.is_active),
+          allowedApps: row.allowed_apps || [],
+          createdAt: row.created_at || '',
+          updatedAt: row.updated_at || '',
+          source: 'postgresql_authoritative'
+        });
+      }
+    } catch (pgErr: any) {
+      console.warn('[AdminAccounts] PostgreSQL search fallback notice:', pgErr.message);
+    }
+
+    // 2. Secondary: Complement with Firestore Collections if not already seen
+    const matchFilter = (item: any) => {
+      if (search && typeof search === 'string' && search.trim()) {
+        const q = search.trim().toLowerCase();
+        const nMatch = (item.name || '').toLowerCase().includes(q);
+        const eMatch = (item.email || '').toLowerCase().includes(q);
+        const pMatch = (item.phone || '').includes(q);
+        if (!nMatch && !eMatch && !pMatch) return false;
+      }
+      if (role && typeof role === 'string' && role.trim() && item.role !== role.trim()) return false;
+      if (status && typeof status === 'string' && status.trim() && item.status !== status.trim()) return false;
+      if (branchId && typeof branchId === 'string' && branchId.trim() && item.branchId !== branchId.trim()) return false;
+      if (franchiseId && typeof franchiseId === 'string' && franchiseId.trim() && item.franchiseId !== franchiseId.trim()) return false;
+      return true;
+    };
+
+    // Restaurant Managers
     const mgrSnap = await adminDb.collection('restaurant_managers').get().catch(() => ({ docs: [] } as any));
     for (const d of mgrSnap.docs) {
       const data = d.data();
       const uid = data.uid || d.id;
-      if (!seenUids.has(uid)) {
+      const emailLower = (data.email || '').toLowerCase().trim();
+      if (!seenUids.has(uid) && (!emailLower || !seenEmails.has(emailLower))) {
+        if (emailLower) seenEmails.add(emailLower);
         seenUids.add(uid);
-        accounts.push({
+        const item = {
           id: d.id,
           uid,
           name: data.name || data.displayName || 'Restaurant Manager',
@@ -378,19 +488,23 @@ router.get('/accounts', async (req: AuthRequest, res: Response) => {
           status: data.status || (data.isActive !== false ? 'APPROVED' : 'DISABLED'),
           isActive: data.isActive !== false && data.status !== 'REJECTED' && data.status !== 'DEACTIVATED',
           createdAt: data.createdAt || '',
-          approvedAt: data.approvedAt || ''
-        });
+          approvedAt: data.approvedAt || '',
+          source: 'firestore_profile'
+        };
+        if (matchFilter(item)) accounts.push(item);
       }
     }
 
-    // 2. POS Accounts
+    // POS Accounts
     const posSnap = await adminDb.collection('pos_accounts').get().catch(() => ({ docs: [] } as any));
     for (const d of posSnap.docs) {
       const data = d.data();
       const uid = data.uid || d.id;
-      if (!seenUids.has(uid)) {
+      const emailLower = (data.email || '').toLowerCase().trim();
+      if (!seenUids.has(uid) && (!emailLower || !seenEmails.has(emailLower))) {
+        if (emailLower) seenEmails.add(emailLower);
         seenUids.add(uid);
-        accounts.push({
+        const item = {
           id: d.id,
           uid,
           name: data.cashierName || data.name || 'POS Operator',
@@ -405,45 +519,23 @@ router.get('/accounts', async (req: AuthRequest, res: Response) => {
           status: data.status || (data.isActive !== false ? 'APPROVED' : 'DISABLED'),
           isActive: data.isActive !== false && data.status !== 'REJECTED' && data.status !== 'REVOKED',
           createdAt: data.createdAt || '',
-          approvedAt: data.approvedAt || ''
-        });
+          approvedAt: data.approvedAt || '',
+          source: 'firestore_profile'
+        };
+        if (matchFilter(item)) accounts.push(item);
       }
     }
 
-    // 3. Franchise Users
-    const fraSnap = await adminDb.collection('franchise_users').get().catch(() => ({ docs: [] } as any));
-    for (const d of fraSnap.docs) {
-      const data = d.data();
-      const uid = data.uid || d.id;
-      if (!seenUids.has(uid)) {
-        seenUids.add(uid);
-        accounts.push({
-          id: d.id,
-          uid,
-          name: data.name || data.displayName || 'Franchise Manager',
-          email: data.email || '',
-          phone: data.phone || '',
-          role: 'franchise_manager',
-          targetApp: 'FRANCHISE_MANAGER',
-          appLabel: 'Franchise Management',
-          franchiseId: data.franchiseId || '',
-          branchId: data.branchId || '',
-          status: data.status || (data.isActive !== false ? 'APPROVED' : 'DISABLED'),
-          isActive: data.isActive !== false && data.status !== 'REJECTED',
-          createdAt: data.createdAt || '',
-          approvedAt: data.approvedAt || ''
-        });
-      }
-    }
-
-    // 4. Delivery Partners
+    // Delivery Partners
     const delSnap = await adminDb.collection('delivery_partners').get().catch(() => ({ docs: [] } as any));
     for (const d of delSnap.docs) {
       const data = d.data();
       const uid = data.uid || d.id;
-      if (!seenUids.has(uid)) {
+      const emailLower = (data.email || '').toLowerCase().trim();
+      if (!seenUids.has(uid) && (!emailLower || !seenEmails.has(emailLower))) {
+        if (emailLower) seenEmails.add(emailLower);
         seenUids.add(uid);
-        accounts.push({
+        const item = {
           id: d.id,
           uid,
           name: data.name || 'Delivery Partner',
@@ -457,8 +549,10 @@ router.get('/accounts', async (req: AuthRequest, res: Response) => {
           status: data.status || (data.isActive !== false ? 'APPROVED' : 'DISABLED'),
           isActive: data.isActive !== false && data.status !== 'REJECTED' && data.status !== 'BLOCKED',
           createdAt: data.createdAt || '',
-          approvedAt: data.approvedAt || ''
-        });
+          approvedAt: data.approvedAt || '',
+          source: 'firestore_profile'
+        };
+        if (matchFilter(item)) accounts.push(item);
       }
     }
 

@@ -20,7 +20,7 @@ const requireInternalOrAdmin = (req: any, res: any, next: any) => {
     return next();
   }
   return verifyToken(req, res, () => {
-    requireRole(['owner', 'admin', 'developer', 'system'])(req, res, next);
+    requireRole(['owner', 'admin', 'developer', 'system', 'platform_owner', 'restaurant_manager', 'franchise_owner', 'franchise_manager'])(req, res, next);
   });
 };
 
@@ -110,8 +110,22 @@ const router = express.Router();
 router.post('/transactional', requireInternalOrAdmin, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { event, data } = req.body;
+    const { event, data, to, recipient, subject, html, message } = req.body;
     const ownerEmail = process.env.OWNER_EMAIL || 'webhub2811@gmail.com';
+
+    // 0. Direct Operational Email Dispatch (from Restaurant Manager / Owner Dashboard)
+    const targetRecipient = to || recipient || data?.recipient || data?.to;
+    const targetSubject = subject || data?.subject;
+    const targetHtml = html || message || data?.html || data?.message;
+
+    if (targetRecipient && targetSubject && targetHtml) {
+      const sanitized = sanitizeEmailHtml(targetHtml);
+      const wrapped = sanitized.includes('<html') ? sanitized : wrapper(sanitized);
+      await queueEmail(targetRecipient, targetSubject, wrapped, 'transactional');
+      console.log(`[Email] Direct Transactional Dispatch | Recipient: ${targetRecipient} | Subject: ${targetSubject} | Success: true | Duration: ${Date.now() - startTime}ms`);
+      res.json({ success: true, message: "Operational email queued and dispatched successfully", recipient: targetRecipient });
+      return;
+    }
     
     if (event === 'REGISTER') {
       await queueEmail(
@@ -506,7 +520,7 @@ router.get('/analytics', verifyToken, requireRole(['owner', 'admin', 'developer'
 });
 
 // 4.5 Logs (Transactional & Marketing)
-router.get('/logs', verifyToken, requireRole(['owner', 'admin', 'developer']), async (req: AuthRequest, res) => {
+router.get('/logs', verifyToken, requireRole(['owner', 'admin', 'developer', 'platform_owner', 'restaurant_manager', 'franchise_owner', 'franchise_manager']), async (req: AuthRequest, res) => {
   try {
     const { type, limit = 50, offset = 0, search = '' } = req.query;
     

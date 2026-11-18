@@ -1014,7 +1014,7 @@ export class OrderStateMachine {
 
       // 3. Restaurant Branch Notification on DELIVERED (Immediate alert + distinct delivered sound)
       if (toState === 'delivered') {
-        const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId);
+        const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId, order.franchiseId || 'fra_rajnandgaon');
         if (branchStaffUids.length > 0) {
           const restEventId = `notif_rest_deliv_${orderId}_v${eventVersion}`;
           const deliveredPayload = RestaurantTemplates.orderDelivered(orderId, {

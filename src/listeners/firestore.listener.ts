@@ -406,33 +406,8 @@ export class FirestoreListener {
                   }, 'DELIVERY_ASSIGNED');
                 }
 
-                // If order was delivered, notify the branch restaurant staff with delivery success sound
-                if (currentStatus === 'delivered') {
-                  const branchId = (orderData.branchId || '').trim();
-                  const franchiseId = (orderData.franchiseId || '').trim();
-                  if (branchId) {
-                    const branchStaff = await notificationEngine.resolveBranchStaff(branchId, franchiseId);
-                    if (branchStaff.length > 0) {
-                      const deliveredPayload = RestaurantTemplates.orderDelivered(orderData.id, {
-                        orderNumber,
-                        customerName: orderData.customerName || 'Customer',
-                        totalAmount,
-                        branchId,
-                        franchiseId,
-                        riderName: orderData.deliveryPartnerName,
-                        deliveryAddress: orderData.deliveryAddress?.addressLine || orderData.deliveryAddress || 'Delivery Address',
-                        deliveredAt: new Date().toISOString(),
-                      });
-                      await notificationEngine.sendBulk(branchStaff, deliveredPayload, {
-                        orderId: orderData.id,
-                        category: 'simple_informational',
-                        priority: 'high',
-                        tag: `order_delivered_${orderData.id}`,
-                        targetApp: 'restaurant'
-                      });
-                    }
-                  }
-                }
+                // Restaurant staff only receives NEW_ORDER alerts with urgent alarms per project requirements.
+                // Customer order lifecycle updates (delivered, out for delivery) are strictly for the customer device app.
               } catch (notifErr: any) {
                 console.warn(`[FirestoreListener] Status change push notification error:`, notifErr.message);
               }

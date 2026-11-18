@@ -698,16 +698,103 @@ router.post('/branch/:branchId/local-product', verifyToken, requireRole(['restau
   }
 });
 
+// ============================================================================
+// 4. FRANCHISE SPECIFIC PRICING & PERMANENT FIRESTORE STORAGE
+// ============================================================================
+
+router.post('/franchise-pricing', verifyToken, requireRole(['owner', 'admin', 'developer', 'platform_owner', 'franchise_owner', 'franchise_manager']), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { productId, franchiseId, price, isAvailable } = req.body;
+    if (!productId || !franchiseId || price === undefined) {
+      res.status(400).json({ success: false, error: 'productId, franchiseId, and price are required' });
+      return;
+    }
+
+    const numericPrice = Number(price);
+    if (isNaN(numericPrice) || numericPrice <= 0) {
+      res.status(400).json({ success: false, error: 'Price must be a valid positive number' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const activeState = isAvailable !== undefined ? Boolean(isAvailable) : true;
+
+    // 1. Permanent Persistence to Firestore products collection
+    await adminDb.collection('products').doc(productId).set({
+      franchise_pricing: {
+        [franchiseId]: {
+          price: numericPrice,
+          isAvailable: activeState,
+          updatedAt: nowIso
+        }
+      },
+      updatedAt: nowIso
+    }, { merge: true });
+
+    // 2. Also sync to PostgreSQL franchise_prices table for SQL durability
+    try {
+      await query(
+        `INSERT INTO franchise_prices (branch_id, product_id, selling_price, is_available, updated_at)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+         ON CONFLICT (branch_id, product_id) DO UPDATE
+         SET selling_price = EXCLUDED.selling_price, is_available = EXCLUDED.is_available, updated_at = CURRENT_TIMESTAMP`,
+        [franchiseId, productId, numericPrice, activeState]
+      );
+    } catch (pgErr: any) {
+      console.warn('[MenuRoutes] Postgres franchise_prices sync warning:', pgErr?.message);
+    }
+
+    // 3. Purge Redis menu cache so changes take effect immediately
+    await redisService.invalidateMenu();
+
+    // 4. Realtime broadcast to all operational apps
+    webSocketServer.broadcastToAll({
+      type: 'menu.franchise_pricing_updated',
+      data: {
+        productId,
+        franchiseId,
+        price: numericPrice,
+        isAvailable: activeState,
+        timestamp: nowIso
+      }
+    });
+
+    console.log(`[MenuRoutes] ✅ Franchise pricing updated permanently: ${productId} @ ${franchiseId} = ₹${numericPrice}`);
+
+    res.json({
+      success: true,
+      message: `Franchise price for ${franchiseId} updated successfully`,
+      pricing: {
+        productId,
+        franchiseId,
+        price: numericPrice,
+        isAvailable: activeState,
+        updatedAt: nowIso
+      }
+    });
+  } catch (error: any) {
+    console.error('[MenuRoutes] Error setting franchise pricing:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 router.get(['/', '/products'], async (req: Request, res: Response): Promise<void> => {
   try {
+    const franchiseId = (req.query.franchiseId as string || '').trim();
+    const branchId = (req.query.branchId as string || '').trim();
+
+    const cacheKey = franchiseId 
+      ? `cache:menu:franchise:${franchiseId}` 
+      : (branchId ? `cache:menu:branch:${branchId}` : 'cache:menu:all');
+
     const items = await redisService.fetchWithStampedeProtection<any[]>(
-      'cache:menu:all',
+      cacheKey,
       async () => {
         let pDocs: any[] = [];
         try {
           const pSnap = await Promise.race([
             adminDb.collection('products').get(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 2500))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 3000))
           ]);
           pDocs = (pSnap as any)?.docs || [];
         } catch (fsErr: any) {
@@ -716,21 +803,53 @@ router.get(['/', '/products'], async (req: Request, res: Response): Promise<void
 
         let prods = pDocs.map(doc => {
           const data = doc.data();
+          const basePrice = Number(data.basePrice || data.price || 299);
+          const franchisePricingMap = data.franchise_pricing || {};
+
+          // Resolve franchise or branch specific price override
+          let effectivePrice = basePrice;
+          let effectiveAvailability = data.isActive ?? data.isAvailable ?? true;
+          let hasOverride = false;
+
+          if (franchiseId && franchisePricingMap[franchiseId]) {
+            const fOverride = franchisePricingMap[franchiseId];
+            if (fOverride.price !== undefined && !isNaN(Number(fOverride.price))) {
+              effectivePrice = Number(fOverride.price);
+              hasOverride = true;
+            }
+            if (fOverride.isAvailable !== undefined) {
+              effectiveAvailability = Boolean(fOverride.isAvailable);
+            }
+          } else if (branchId && franchisePricingMap[branchId]) {
+            const bOverride = franchisePricingMap[branchId];
+            if (bOverride.price !== undefined && !isNaN(Number(bOverride.price))) {
+              effectivePrice = Number(bOverride.price);
+              hasOverride = true;
+            }
+            if (bOverride.isAvailable !== undefined) {
+              effectiveAvailability = Boolean(bOverride.isAvailable);
+            }
+          }
+
           return {
             id: doc.id,
             name: data.productName || data.name || 'Artisan Woodfired Pizza',
             productName: data.productName || data.name || 'Artisan Woodfired Pizza',
             description: data.description || 'Handcrafted 100% Pure Vegetarian delicacy from Olive Pizza stone ovens.',
-            basePrice: Number(data.basePrice || data.price || 299),
-            price: Number(data.basePrice || data.price || 299),
+            basePrice: basePrice,
+            price: effectivePrice,
+            effectivePrice: effectivePrice,
+            isFranchiseOverridden: hasOverride,
+            franchise_pricing: franchisePricingMap,
             category: data.category || 'pizza',
             image: data.imageUrl || data.image || 'https://res.cloudinary.com/dxmlvkff1/image/upload/v1786517437/olive-pizza/ai-product-images/dv4uty06rq4tznlpqz2i.jpg',
             imageUrl: data.imageUrl || data.image || 'https://res.cloudinary.com/dxmlvkff1/image/upload/v1786517437/olive-pizza/ai-product-images/dv4uty06rq4tznlpqz2i.jpg',
             isVegetarian: data.isVegetarian ?? true,
-            isAvailable: data.isActive ?? data.isAvailable ?? true,
+            isAvailable: effectiveAvailability,
             variants: data.variants || [],
             crusts: data.crusts || [],
-            addons: data.addons || []
+            addons: data.addons || [],
+            createdAt: data.createdAt || new Date().toISOString()
           };
         });
 
@@ -745,13 +864,17 @@ router.get(['/', '/products'], async (req: Request, res: Response): Promise<void
               category: 'pizza',
               basePrice: 199,
               price: 199,
+              effectivePrice: 199,
+              isFranchiseOverridden: false,
+              franchise_pricing: {},
               image: 'https://images.unsplash.com/photo-1574071318508-1cdbab80d002?w=400',
               imageUrl: 'https://images.unsplash.com/photo-1574071318508-1cdbab80d002?w=400',
               isVegetarian: true,
               isAvailable: true,
               variants: ['Regular (7")', 'Medium (10")', 'Large (12")'],
               crusts: ['Classic Hand Tossed', 'Thin Crust', 'Cheese Burst'],
-              addons: [{ id: 'add_extra_cheese', name: 'Extra Cheese', price: 60 }]
+              addons: [{ id: 'add_extra_cheese', name: 'Extra Cheese', price: 60 }],
+              createdAt: new Date().toISOString()
             },
             {
               id: 'prod_farmhouse',
@@ -761,13 +884,17 @@ router.get(['/', '/products'], async (req: Request, res: Response): Promise<void
               category: 'pizza',
               basePrice: 349,
               price: 349,
+              effectivePrice: 349,
+              isFranchiseOverridden: false,
+              franchise_pricing: {},
               image: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?w=400',
               imageUrl: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?w=400',
               isVegetarian: true,
               isAvailable: true,
               variants: ['Regular (7")', 'Medium (10")', 'Large (12")'],
               crusts: ['Classic Hand Tossed', 'Thin Crust', 'Cheese Burst'],
-              addons: [{ id: 'add_extra_cheese', name: 'Extra Cheese', price: 60 }]
+              addons: [{ id: 'add_extra_cheese', name: 'Extra Cheese', price: 60 }],
+              createdAt: new Date().toISOString()
             }
           ];
         }
@@ -776,7 +903,14 @@ router.get(['/', '/products'], async (req: Request, res: Response): Promise<void
       },
       { ttlSeconds: 300, jitterSeconds: 30 }
     );
-    res.json({ success: true, count: items.length, products: items, items });
+    res.json({ 
+      success: true, 
+      count: items.length, 
+      franchiseId: franchiseId || null, 
+      branchId: branchId || null, 
+      products: items, 
+      items 
+    });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }

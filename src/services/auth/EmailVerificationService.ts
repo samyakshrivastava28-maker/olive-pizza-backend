@@ -17,6 +17,24 @@ export interface VerificationCheckResult {
   message: string;
 }
 
+interface StoredVerificationData {
+  email: string;
+  codeHash: string;
+  salt: string;
+  expiresAt: number;
+  lastRequestedAt: number;
+  windowStart: number;
+  requestCount: number;
+  verifyAttempts: number;
+  attempts: number;
+  used: boolean;
+  consumed: boolean;
+  ipAddress: string;
+  code?: string;
+}
+
+const memoryCodeStore = new Map<string, StoredVerificationData>();
+
 export class EmailVerificationService {
   private static readonly COLLECTION = 'email_verification_codes';
   private static readonly CODE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes strict TTL
@@ -52,13 +70,20 @@ export class EmailVerificationService {
     const docId = this.getDocId(cleanEmail);
     const now = Date.now();
 
-    if (!adminDb) {
-      return { success: false, message: 'Database service unavailable.' };
-    }
+    let existing: any = memoryCodeStore.get(docId) || null;
+    let ref: any = null;
 
-    const ref = adminDb.collection(this.COLLECTION).doc(docId);
-    const snap = await ref.get();
-    const existing = snap.data();
+    if (adminDb) {
+      try {
+        ref = adminDb.collection(this.COLLECTION).doc(docId);
+        const snap = await ref.get();
+        if (snap.exists) {
+          existing = snap.data();
+        }
+      } catch (fsErr: any) {
+        console.warn(`[EmailVerificationService] Notice reading from Firestore for ${cleanEmail}:`, fsErr?.message);
+      }
+    }
 
     // Check 60-second cooldown
     if (existing && existing.lastRequestedAt && (now - existing.lastRequestedAt < this.RESEND_COOLDOWN_MS)) {
@@ -95,8 +120,7 @@ export class EmailVerificationService {
     const codeHash = this.hashCode(code, salt);
     const expiresAt = now + this.CODE_EXPIRY_MS;
 
-    // Store salted hash at rest
-    await ref.set({
+    const recordToSave: StoredVerificationData = {
       email: cleanEmail,
       codeHash,
       salt,
@@ -109,7 +133,18 @@ export class EmailVerificationService {
       used: false,
       consumed: false,
       ipAddress,
-    });
+      code
+    };
+
+    // Store in memory cache immediately (authoritative & resilient)
+    memoryCodeStore.set(docId, recordToSave);
+
+    // Also persist to Firestore if available without crashing on quota
+    if (ref) {
+      ref.set(recordToSave).catch((fsSetErr: any) => {
+        console.warn(`[EmailVerificationService] Notice persisting to Firestore for ${cleanEmail}:`, fsSetErr?.message);
+      });
+    }
 
     // Send styled transactional email using existing direct transporter
     const emailHtml = `
@@ -147,16 +182,13 @@ export class EmailVerificationService {
       </div>
     `;
 
-    // Dispatch email asynchronously using high-speed pooled SMTP queue (matching order emails)
-    queueEmail(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml, 'auth')
-      .then((queueId) => {
-        console.log(`[EmailVerificationService] ✅ Verification email queued for ${cleanEmail} (ID: ${queueId})`);
-      })
-      .catch((err: any) => {
-        console.warn(`[EmailVerificationService] Queue error, using direct pooled SMTP send:`, err?.message);
-        sendEmailDirect(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml)
-          .then(() => console.log(`[EmailVerificationService] ✅ Verification email delivered directly via SMTP to ${cleanEmail}`))
-          .catch((directErr: any) => console.error('[EmailVerificationService] ❌ Failed to dispatch email via SMTP:', directErr?.message || directErr));
+    // Dispatch email immediately using high-speed pooled SMTP transporter for zero-delay OTP delivery
+    sendEmailDirect(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml)
+      .then(() => console.log(`[EmailVerificationService] ✅ Verification email delivered immediately via SMTP to ${cleanEmail}`))
+      .catch((directErr: any) => {
+        console.warn('[EmailVerificationService] Direct send warning, queuing as fallback:', directErr?.message);
+        queueEmail(cleanEmail, `Your Olive Pizza ${digits}-Digit Verification Code`, emailHtml, 'auth')
+          .catch((qErr: any) => console.error('[EmailVerificationService] ❌ Failed to queue verification email:', qErr?.message));
       });
 
     // Record audit event asynchronously
@@ -197,14 +229,25 @@ export class EmailVerificationService {
     }
 
     const docId = this.getDocId(cleanEmail);
-    const ref = adminDb.collection(this.COLLECTION).doc(docId);
-    const snap = await ref.get();
+    let data: any = memoryCodeStore.get(docId) || null;
+    let ref: any = null;
 
-    if (!snap.exists) {
+    if (adminDb) {
+      try {
+        ref = adminDb.collection(this.COLLECTION).doc(docId);
+        const snap = await ref.get();
+        if (snap.exists) {
+          data = snap.data();
+        }
+      } catch (fsErr: any) {
+        console.warn(`[EmailVerificationService] Notice reading verification doc from Firestore for ${cleanEmail}:`, fsErr?.message);
+      }
+    }
+
+    if (!data) {
       return { success: false, message: 'No active verification code found for this email. Please request a code.' };
     }
 
-    const data = snap.data()!;
     const now = Date.now();
 
     if (data.consumed || data.used) {
@@ -218,7 +261,12 @@ export class EmailVerificationService {
     const currentAttempts = (data.attempts !== undefined ? data.attempts : (data.verifyAttempts || 0)) + 1;
     if (currentAttempts > this.MAX_VERIFY_ATTEMPTS || (data.attempts !== undefined && data.attempts >= this.MAX_VERIFY_ATTEMPTS)) {
       // Invalidate code due to brute-force attempts
-      await ref.update({ used: true, consumed: true, verifyAttempts: currentAttempts, attempts: currentAttempts });
+      data.used = true;
+      data.consumed = true;
+      data.verifyAttempts = currentAttempts;
+      data.attempts = currentAttempts;
+      memoryCodeStore.set(docId, data);
+      if (ref) ref.update({ used: true, consumed: true, verifyAttempts: currentAttempts, attempts: currentAttempts }).catch(() => {});
       await AuthAuditService.logEvent({
         eventType: 'EMAIL_CODE_FAILED',
         identifier: cleanEmail,
@@ -236,7 +284,10 @@ export class EmailVerificationService {
     );
 
     if (!isMatch) {
-      await ref.update({ verifyAttempts: currentAttempts, attempts: currentAttempts });
+      data.verifyAttempts = currentAttempts;
+      data.attempts = currentAttempts;
+      memoryCodeStore.set(docId, data);
+      if (ref) ref.update({ verifyAttempts: currentAttempts, attempts: currentAttempts }).catch(() => {});
       await AuthAuditService.logEvent({
         eventType: 'EMAIL_CODE_FAILED',
         identifier: cleanEmail,
@@ -248,13 +299,18 @@ export class EmailVerificationService {
     }
 
     // Mark code as used immediately (single-use)
-    await ref.update({
-      used: true,
-      consumed: true,
-      verifiedAt: now,
-      verifyAttempts: currentAttempts,
-      attempts: currentAttempts,
-    });
+    data.used = true;
+    data.consumed = true;
+    memoryCodeStore.set(docId, data);
+    if (ref) {
+      await ref.update({
+        used: true,
+        consumed: true,
+        verifiedAt: now,
+        verifyAttempts: currentAttempts,
+        attempts: currentAttempts,
+      }).catch(() => {});
+    }
 
     // Authoritatively mark user record as email verified in Firebase Auth and Firestore
     try {

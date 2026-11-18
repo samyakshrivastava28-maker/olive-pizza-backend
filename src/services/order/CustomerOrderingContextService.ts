@@ -1,5 +1,6 @@
 import { adminDb } from '../../config/firebase.js';
 import { withTimeout } from '../../lib/utils.js';
+import { GeohashService } from '../location/GeohashService.js';
 
 export interface CustomerOrderingContext {
   customerId: string;
@@ -14,6 +15,7 @@ export interface CustomerOrderingContext {
   distanceKm: number;
   deliveryRadiusKm: number;
   deliveryFee?: number;
+  geohash?: string;
   version: number;
   resolvedAt: string;
   expiresAt: number;
@@ -331,9 +333,23 @@ export class CustomerOrderingContextService {
 
     // 2. Strict Delivery Radius Evaluation
     if (!closestBranch) {
+      let nearestAnyBranch: any = null;
+      let nearestDist = Infinity;
+      for (const b of branches) {
+        const d = this.haversineDistanceKm(custLat, custLng, b.lat, b.lng);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearestAnyBranch = b;
+        }
+      }
+      const roundedDist = Math.round(nearestDist * 10) / 10;
+      const branchName = nearestAnyBranch?.name || 'Olive Pizza';
+      const maxRadius = nearestAnyBranch?.deliveryRadiusKm || 15;
+      const userGeohash = GeohashService.encode(custLat, custLng, 6);
+
       return {
         isServiceable: false,
-        error: "We currently don't deliver to this location.",
+        error: `Your location is ${roundedDist} km away from ${branchName} (maximum delivery radius is ${maxRadius} km). Store pickup and takeaway are available!`,
         code: 'OUT_OF_DELIVERY_ZONE'
       };
     }
@@ -343,6 +359,7 @@ export class CustomerOrderingContextService {
     const resolvedBranchName = closestBranch.name || 'Olive Pizza Branch';
     const now = Date.now();
     const version = now;
+    const userGeohash = GeohashService.encode(custLat, custLng, 6);
 
     const context: CustomerOrderingContext = {
       customerId: customerId || 'guest',
@@ -357,6 +374,7 @@ export class CustomerOrderingContextService {
       distanceKm: Math.round(minDistance * 100) / 100,
       deliveryRadiusKm: closestBranch.maxRadius,
       deliveryFee: minDistance > 5 ? 40 : 30,
+      geohash: userGeohash,
       version,
       resolvedAt: new Date().toISOString(),
       expiresAt: now + (60 * 60 * 1000) // 1 hour validity

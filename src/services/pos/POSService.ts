@@ -101,18 +101,29 @@ export class POSService {
   /**
    * Authoritative catalog item lookup across products, menu_items, and combos.
    */
-  public static async getCatalogItem(itemId: string): Promise<any | null> {
+  public static async getCatalogItem(itemId: string, itemName?: string): Promise<any | null> {
     if (!itemId || typeof itemId !== 'string') return null;
     const now = Date.now();
-    const cached = this.catalogCache.get(itemId);
+    const cacheKey = `${itemId}:${itemName || ''}`;
+    const cached = this.catalogCache.get(cacheKey) || this.catalogCache.get(itemId);
     if (cached && (now - cached.timestamp) < this.CATALOG_CACHE_TTL_MS) {
       return cached.item;
     }
 
     try {
-      // 0. Primary: PostgreSQL menu_products & menu_combos
+      // 0. Primary: PostgreSQL menu_products & menu_combos by ID
       try {
-        const pgProd = await query('SELECT * FROM menu_products WHERE id = $1 LIMIT 1', [itemId]);
+        let pgProd = await query('SELECT * FROM menu_products WHERE id = $1 LIMIT 1', [itemId]);
+        if (pgProd.rows.length === 0 && itemName) {
+          // Fallback: match by product name keyword in PostgreSQL
+          const cleanName = itemName.replace(/[^a-zA-Z0-9\s]/g, '').trim();
+          const firstWord = cleanName.split(/\s+/)[0] || cleanName;
+          pgProd = await query(
+            'SELECT * FROM menu_products WHERE name ILIKE $1 OR name ILIKE $2 LIMIT 1',
+            [`%${cleanName}%`, `%${firstWord}%`]
+          );
+        }
+
         if (pgProd.rows.length > 0) {
           const r = pgProd.rows[0];
           const item = {
@@ -131,6 +142,7 @@ export class POSService {
             channelAvailability: r.channel_availability,
             rating: Number(r.rating)
           };
+          this.catalogCache.set(cacheKey, { item, timestamp: now });
           this.catalogCache.set(itemId, { item, timestamp: now });
           return item;
         }

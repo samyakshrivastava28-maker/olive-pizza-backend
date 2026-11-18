@@ -475,7 +475,7 @@ router.post('/action', verifyToken, async (req: AuthRequest, res: Response): Pro
         backgroundTasks.push(async () => {
           try {
             const branchId = orderData.branchId || 'main_branch';
-            const branchStaff = await notificationEngine.resolveBranchStaff(branchId);
+            const branchStaff = await notificationEngine.resolveBranchStaff(branchId, orderData.franchiseId || 'fra_rajnandgaon');
             if (branchStaff.length > 0) {
               const stopPayload = { data: { action: 'stop_alert', orderId } } as any;
               await notificationEngine.sendBulk(branchStaff, stopPayload, { category: 'alarm_actionable', priority: 'high', orderId, tag: `order_restaurant_${orderId}`, targetApp: 'restaurant' });
@@ -504,7 +504,7 @@ router.post('/action', verifyToken, async (req: AuthRequest, res: Response): Pro
         backgroundTasks.push(async () => {
           try {
             const branchId = orderData.branchId || 'main_branch';
-            const branchStaff = await notificationEngine.resolveBranchStaff(branchId);
+            const branchStaff = await notificationEngine.resolveBranchStaff(branchId, orderData.franchiseId || 'fra_rajnandgaon');
             if (branchStaff.length > 0) {
               const stopPayload = { data: { action: 'stop_alert', orderId } } as any;
               await notificationEngine.sendBulk(branchStaff, stopPayload, { category: 'alarm_actionable', priority: 'high', orderId, tag: `order_restaurant_${orderId}`, targetApp: 'restaurant' });
@@ -1097,32 +1097,54 @@ router.post('/register-token', verifyToken, async (req: AuthRequest, res: Respon
 // =============================================================================
 // POST /notifications/token/deregister
 // =============================================================================
-router.post('/token/deregister', verifyToken, async (req: AuthRequest, res: Response): Promise<void> => {
+router.post('/token/deregister', async (req: Request, res: Response): Promise<void> => {
   try {
     const { token } = req.body;
-    const userId = req.user!.uid;
+    let userId: string | null = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1].trim(), false);
+        userId = decoded?.uid || null;
+      } catch {}
+    }
+
+    if (!token && !userId) {
+      res.status(400).json({ error: 'Token or authenticated session is required to deregister' });
+      return;
+    }
 
     const client = await pgPool.connect();
     try {
       let result;
       if (token && token !== 'all') {
-        result = await client.query(
-          `UPDATE fcm_tokens SET is_active = FALSE, updated_at = NOW()
-           WHERE token = $1 AND user_id = $2`,
-          [token, userId]
-        );
+        if (userId) {
+          result = await client.query(
+            `UPDATE fcm_tokens SET is_active = FALSE, updated_at = NOW()
+             WHERE token = $1 AND user_id = $2`,
+            [token, userId]
+          );
+        } else {
+          result = await client.query(
+            `UPDATE fcm_tokens SET is_active = FALSE, updated_at = NOW()
+             WHERE token = $1`,
+            [token]
+          );
+        }
         try {
           const { FieldValue } = await import('firebase-admin/firestore');
           const cryptoMod = await import('crypto');
           const tokenHash = cryptoMod.createHash('sha256').update(token).digest('hex').slice(0, 16);
-          await db.collection('users').doc(userId).collection('devices').doc(tokenHash).delete().catch(() => {});
-          await db.collection('users').doc(userId).update({
-            fcmTokens: FieldValue.arrayRemove(token),
-          }).catch(() => {});
+          if (userId) {
+            await db.collection('users').doc(userId).collection('devices').doc(tokenHash).delete().catch(() => {});
+            await db.collection('users').doc(userId).update({
+              fcmTokens: FieldValue.arrayRemove(token),
+            }).catch(() => {});
+          }
         } catch (fsErr: any) {
           console.warn('[TokenDeregister] Firestore arrayRemove failed (non-fatal):', fsErr.message);
         }
-      } else {
+      } else if (userId) {
         result = await client.query(
           `UPDATE fcm_tokens SET is_active = FALSE, updated_at = NOW()
            WHERE user_id = $1`,
@@ -1337,6 +1359,7 @@ router.post('/send-custom', verifyToken, requireRole(['owner', 'admin', 'develop
     const rawAudience = (req.body.targetAudience || req.body.audience || 'customers').toLowerCase();
     const callerRole = (req.user?.role || 'customer').toLowerCase();
     const callerBranchId = req.user?.branchId || req.body.branchId;
+    const callerFranchiseId = req.user?.franchiseId || req.body.franchiseId || 'fra_rajnandgaon';
     const isRestaurantManager = ['restaurant_manager', 'manager', 'kitchen_staff', 'cashier'].includes(callerRole);
 
     if (!title || !body) {
@@ -1379,10 +1402,10 @@ router.post('/send-custom', verifyToken, requireRole(['owner', 'admin', 'develop
           .get();
         targetUids = branchRidersSnap.docs.map(d => d.id);
       } else if (audience === 'staff') {
-        targetUids = await notificationEngine.resolveBranchStaff(callerBranchId);
+        targetUids = await notificationEngine.resolveBranchStaff(callerBranchId, callerFranchiseId);
       } else {
         // 'all' within this branch
-        const staff = await notificationEngine.resolveBranchStaff(callerBranchId);
+        const staff = await notificationEngine.resolveBranchStaff(callerBranchId, callerFranchiseId);
         const branchRidersSnap = await db.collection('users')
           .where('role', 'in', ['delivery', 'delivery_partner'])
           .where('branchId', '==', callerBranchId)

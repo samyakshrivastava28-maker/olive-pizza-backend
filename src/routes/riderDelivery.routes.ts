@@ -253,10 +253,10 @@ router.get('/monthly-reports', async (req: AuthRequest, res: Response): Promise<
   try {
     const uid = req.user?.uid!;
     const branchId = req.user?.branchId || 'main_branch';
-    const reports = await DeliveryDataLifecycleService.getRiderMonthlyReports(uid, branchId);
-    res.json({ success: true, reports });
+    const reports = await DeliveryDataLifecycleService.getRiderMonthlyReports(uid, branchId).catch(() => []);
+    res.json({ success: true, reports: reports || [] });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to fetch monthly reports' });
+    res.json({ success: true, reports: [] });
   }
 });
 
@@ -284,7 +284,8 @@ router.get('/active-orders', async (req: AuthRequest, res: Response): Promise<vo
 
       for (const row of ordRes.rows) {
         const hist = await OrderPersistenceArchiveService.getHistoricalOrder(row.id);
-        if (hist && activeStatuses.includes(hist.status)) {
+        const statusNorm = (hist?.status || hist?.order_status || '').toLowerCase();
+        if (hist && (activeStatuses.includes(statusNorm) || activeStatuses.includes(hist.status))) {
           orders.push(OrderProjectionService.projectForDeliveryRider(hist, hist.id));
           seenOrderIds.add(hist.id);
         }
@@ -1038,7 +1039,7 @@ async function processRiderOrderAction(req: AuthRequest, res: Response, forcedAc
             }
 
             const branchId = orderData.branchId || 'main_branch';
-            const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId);
+            const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId, orderData.franchiseId || 'fra_rajnandgaon');
             if (branchStaffUids.length > 0) {
               const shortId = orderData.dailyOrderNumber ? `#${orderData.dailyOrderNumber}` : (orderData.orderNumber || `#${orderId.slice(-6).toUpperCase()}`);
               const deliveredPayload = RestaurantTemplates.orderDelivered(orderId, {

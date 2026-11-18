@@ -156,20 +156,33 @@ export class RiderWorkScheduleService {
   }
 
   static async getSchedule(uid: string): Promise<RiderWorkSchedule> {
-    const snap = await adminDb.collection(SCHEDULES).doc(uid).get();
-    if (snap.exists) return { uid, ...snap.data() } as RiderWorkSchedule;
-    const userSnap = await adminDb.collection(USERS).doc(uid).get();
-    const userData = userSnap.exists ? userSnap.data() : {};
-    return {
-      uid,
-      enabled: false,
-      timezone: normalizeTimezone(userData?.timezone || 'Asia/Kolkata'),
-      slots: [],
-      startSound: 'order_alert',
-      endSound: 'order_delivered',
-      continueUntil: null,
-      lastAppliedOnline: null
-    };
+    try {
+      const snap = await adminDb.collection(SCHEDULES).doc(uid).get().catch(() => null);
+      if (snap?.exists) return { uid, ...snap.data() } as RiderWorkSchedule;
+      const userSnap = await adminDb.collection(USERS).doc(uid).get().catch(() => null);
+      const userData = userSnap?.exists ? userSnap.data() : {};
+      return {
+        uid,
+        enabled: false,
+        timezone: normalizeTimezone(userData?.timezone || 'Asia/Kolkata'),
+        slots: [],
+        startSound: 'order_alert',
+        endSound: 'order_delivered',
+        continueUntil: null,
+        lastAppliedOnline: null
+      };
+    } catch {
+      return {
+        uid,
+        enabled: false,
+        timezone: 'Asia/Kolkata',
+        slots: [],
+        startSound: 'order_alert',
+        endSound: 'order_delivered',
+        continueUntil: null,
+        lastAppliedOnline: null
+      };
+    }
   }
 
   static async saveSchedule(uid: string, value: any): Promise<RiderWorkSchedule> {

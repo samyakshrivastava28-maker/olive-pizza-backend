@@ -142,8 +142,14 @@ export class NotificationRouter {
         };
       }
 
-      // Rule 8: Strict Branch Scoping (Cross-Branch Isolation - strictly 1:1, no 'all' permitted)
-      if (!recipient.branchId || !order.branchId || recipient.branchId !== order.branchId) {
+      // Rule 8: Strict Branch Scoping with Canonical Alias Support (main_branch <-> branch_rjn_main)
+      const branchMatches = (a?: string, b?: string): boolean => {
+        if (!a || !b) return false;
+        if (a === b) return true;
+        return (a === 'main_branch' || a === 'branch_rjn_main') && (b === 'main_branch' || b === 'branch_rjn_main');
+      };
+
+      if (!recipient.branchId || !order.branchId || !branchMatches(recipient.branchId, order.branchId)) {
         return {
           allowed: false,
           reason: `Branch mismatch: recipient branch "${recipient.branchId || 'NONE'}" does not match order branch "${order.branchId || 'NONE'}".`
@@ -176,6 +182,19 @@ export class NotificationRouter {
 
     // Rule 10: Customer order status updates
     if (eventType === 'CUSTOMER_ORDER_UPDATE') {
+      // STRICT APP BOUNDARY: Customer notifications must NEVER be delivered to management or staff terminals
+      if (app === 'RESTAURANT' || app === 'RESTAURANT_MANAGER' || app === 'DELIVERY' || app === 'OWNER' || app === 'POS' || app === 'FRANCHISE') {
+        return {
+          allowed: false,
+          reason: `Customer order tracking updates cannot be delivered to ${app} operational terminal.`
+        };
+      }
+      if (role === 'delivery_partner' || role === 'rider' || role === 'pos_operator' || role === 'cashier') {
+        return {
+          allowed: false,
+          reason: `Role ${role} cannot receive customer order tracking updates.`
+        };
+      }
       if (order.userId && recipient.uid !== order.userId) {
         return { allowed: false, reason: 'Customer notifications must strictly match the ordering user ID.' };
       }

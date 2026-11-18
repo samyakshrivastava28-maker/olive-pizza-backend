@@ -12,6 +12,13 @@ export function generateReferenceId(): string {
 export function containsTechnicalLeak(str: string): boolean {
   if (!str || typeof str !== 'string') return false;
   const lower = str.toLowerCase();
+
+  // Refined SQL detection: detect structured SQL query statements instead of naive substring matching
+  const sqlLeakRegex = /(?:select|delete|update)\s+[\s\S]*?\s+from\s+/i;
+  if (sqlLeakRegex.test(str)) {
+    return true;
+  }
+
   return (
     lower.includes('auth/') ||
     lower.includes('firebase') ||
@@ -19,8 +26,6 @@ export function containsTechnicalLeak(str: string): boolean {
     lower.includes('at ') ||
     lower.includes('node_modules') ||
     lower.includes('stack') ||
-    lower.includes('select ') ||
-    lower.includes('from ') ||
     lower.includes('relation ') ||
     lower.includes('syntax error') ||
     lower.includes('violates foreign key') ||
@@ -35,6 +40,14 @@ export function containsTechnicalLeak(str: string): boolean {
     lower.includes('database error')
   );
 }
+
+export const SAFE_BUSINESS_CODES = [
+  'OUT_OF_DELIVERY_ZONE',
+  'BRANCH_MISMATCH',
+  'FRANCHISE_MISMATCH',
+  'LOCATION_REQUIRED',
+  'INVALID_COORDINATES'
+];
 
 /**
  * Normalizes technical error messages and status codes to safe codes and friendly user messages.
@@ -123,6 +136,14 @@ export function sanitizeErrorDetails(errOrMsg: any, statusCode: number): {
     };
   }
 
+  // 3b. Safe Business & Geofence Codes
+  if (SAFE_BUSINESS_CODES.includes(rawCode)) {
+    return {
+      code: rawCode,
+      message: rawMsg || 'The requested operation violates delivery or branch business rules.'
+    };
+  }
+
   if (lower.includes('permission-denied') || lower.includes('permission_denied') || lower.includes('insufficient permissions') || statusCode === 403) {
     // If there is an explicit safe reason (e.g. Owner operational boundary)
     if (lower.includes('restricted from pos') || lower.includes('restricted from restaurant') || lower.includes('restricted from delivery')) {
@@ -203,9 +224,24 @@ export function errorSanitizerMiddleware(req: Request, res: Response, next: Next
         referenceId
       };
 
-      // Preserve safe app authorization fields if present
+      // Preserve safe app authorization and business fields if present
       if (typeof body.authorized === 'boolean') {
         safePayload.authorized = body.authorized;
+      }
+      if (typeof body.isServiceable === 'boolean') {
+        safePayload.isServiceable = body.isServiceable;
+      }
+      if (typeof body.distanceKm === 'number') {
+        safePayload.distanceKm = body.distanceKm;
+      }
+      if (typeof body.maxRadiusKm === 'number') {
+        safePayload.maxRadiusKm = body.maxRadiusKm;
+      }
+      if (body.branchId) {
+        safePayload.branchId = body.branchId;
+      }
+      if (body.franchiseId) {
+        safePayload.franchiseId = body.franchiseId;
       }
       if (body.app) {
         safePayload.app = body.app;

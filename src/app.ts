@@ -151,6 +151,7 @@ const allowedOrigins = [
   'https://olivepizza-owner.onrender.com',
   'https://olive-pizza-ai-frontend.vercel.app',
   'https://olive-pizza-ai.onrender.com',
+  'https://localhost',
   'capacitor://localhost',
   'ionic://localhost',
   ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : [])
@@ -199,8 +200,13 @@ export const corsMiddleware = cors({
       return callback(null, true);
     }
 
-    // 4. Mobile app protocols (exact origins only, no prefix matching)
-    if (origin === 'capacitor://localhost' || origin === 'ionic://localhost') {
+    // 4. Mobile app protocols & Capacitor Android/iOS WebView origins
+    if (
+      origin === 'capacitor://localhost' ||
+      origin === 'ionic://localhost' ||
+      origin === 'https://localhost' ||
+      /^https:\/\/localhost(:\d+)?$/.test(origin)
+    ) {
       return callback(null, true);
     }
 
@@ -226,6 +232,7 @@ app.use(corsMiddleware);
 // Strict, justified request body size limits (defense-in-depth against payload flooding DoS)
 app.use(express.json({
   limit: '2mb',
+  type: ['application/json', 'application/*+json', 'text/plain'],
   verify: (req: any, _res, buf) => {
     req.rawBody = buf;
   }

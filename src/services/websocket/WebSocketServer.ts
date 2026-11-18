@@ -927,8 +927,9 @@ class OliveWebSocketServer {
         const isFranchiseManager = ['franchise_manager', 'franchise_owner'].includes(r) &&
           Boolean(franchiseId && client.franchiseId && client.franchiseId === franchiseId);
 
-        // Staff (restaurant manager / kitchen / cashier / delivery) must explicitly match branch (with main_branch <-> branch_rjn_main alias)
-        const isOperationalStaff = ['restaurant_manager', 'manager', 'branch_manager', 'kitchen_staff', 'cashier', 'pos', 'pos_operator', 'delivery_partner', 'delivery', 'rider'].includes(r);
+        // Staff (restaurant manager / kitchen / cashier / POS) must explicitly match branch (with main_branch <-> branch_rjn_main alias)
+        // Delivery riders must NOT receive kitchen order.created events; riders only receive order updates when explicitly assigned
+        const isOperationalStaff = ['restaurant_manager', 'manager', 'branch_manager', 'kitchen_staff', 'cashier', 'pos', 'pos_operator'].includes(r);
         const isBranchMatch = isOperationalStaff &&
           branchMatches(client.branchId, branchId) &&
           (!client.franchiseId || !franchiseId || client.franchiseId === franchiseId || client.franchiseId === 'fra_primary');

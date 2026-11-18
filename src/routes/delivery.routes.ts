@@ -215,7 +215,7 @@ router.patch('/orders/:id/status', requireRole(['owner', 'delivery', 'delivery_p
         if (status === 'delivered') {
           const branchId = orderData.branchId;
           if (branchId) {
-            const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId);
+            const branchStaffUids = await notificationEngine.resolveBranchStaff(branchId, orderData.franchiseId || 'fra_rajnandgaon');
             if (branchStaffUids.length > 0) {
             const shortId = orderData.dailyOrderNumber ? `#${orderData.dailyOrderNumber}` : (orderData.orderNumber || `#${id.slice(-6).toUpperCase()}`);
             const deliveredPayload = RestaurantTemplates.orderDelivered(id, {

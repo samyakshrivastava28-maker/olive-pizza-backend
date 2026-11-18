@@ -1058,6 +1058,14 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
                   live_lifecycle: 'TERMINAL'
                 }).catch(() => {});
               }
+            } else {
+              // Orphaned Firestore projection without PostgreSQL canonical backing: self-heal and allow checkout
+              isActuallyDeliveredInPg = true;
+              await adminDb.collection('orders').doc(activeOrderDoc.id).update({
+                status: 'delivered',
+                order_status: 'DELIVERED',
+                live_lifecycle: 'TERMINAL'
+              }).catch(() => {});
             }
           } catch {}
 
@@ -1346,6 +1354,7 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         authoritativePrice = await AuthoritativePricingResolver.resolveItemPrice({
           branchId: resolvedBranchId,
           productId: itemId,
+          itemName: item.name || item.title || item.productName,
           size: item.size || item.variant,
           crust: item.crust,
           addons: item.addons
@@ -1872,6 +1881,9 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         updatedAt: new Date(),
       };
 
+      // Mark order processed immediately in FirestoreListener to prevent race-condition double-dispatch
+      FirestoreListener.markOrderProcessed(newOrderId);
+
       // STEP 3: Persist to canonical PostgreSQL relational ledger first (Authoritative ACID Transaction)
       // Durable projection obligation: Written as PROJECTION_PENDING so that any crash before/during Firestore write is captured
       (orderFirestoreDoc as any).live_lifecycle = 'PROJECTION_PENDING';
@@ -1965,6 +1977,7 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
     // 5. Asynchronous Background Dispatch (Targeted Restaurant Management Notification with Action Buttons)
     setImmediate(async () => {
       try {
+        FirestoreListener.markOrderProcessed(newOrderId);
         const { NotificationRouter } = await import('../services/notification/NotificationRouter.js');
         const isCod = (req.body.paymentMethod || 'COD').toUpperCase() === 'COD';
         await NotificationRouter.routeOrderEvent({

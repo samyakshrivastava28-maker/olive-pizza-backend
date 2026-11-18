@@ -475,11 +475,11 @@ export class FranchiseAccessService {
     let pgUserData: any = null;
 
     try {
-      // 1. Primary Deterministic Lookup by verified Firebase UID
+      // 1. Primary Deterministic Lookup by verified Firebase UID or ID
       const uidRes = await query(
-        `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata, created_at, updated_at
+        `SELECT id, firebase_uid, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata, created_at, updated_at
          FROM app_users
-         WHERE id = $1
+         WHERE id = $1 OR firebase_uid = $1
          LIMIT 1`,
         [uid]
       );
@@ -489,7 +489,7 @@ export class FranchiseAccessService {
       } else {
         // 2. UID lookup yielded 0 rows -> Ambiguity and Conflict Detection
         const unlinkedRes = await query(
-          `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata
+          `SELECT id, firebase_uid, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata
            FROM app_users
            WHERE (email IS NOT NULL AND email <> '' AND LOWER(email) = LOWER($1))
               OR ($2 <> '' AND phone IS NOT NULL AND RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $3)`,
@@ -508,10 +508,10 @@ export class FranchiseAccessService {
           // Exactly 1 account exists -> Automatically link Firebase UID to this account
           pgUserData = unlinkedRes.rows[0];
           await query(
-            `UPDATE app_users SET id = $1, is_active = true, updated_at = NOW() WHERE id = $2`,
+            `UPDATE app_users SET firebase_uid = $1, is_active = true, updated_at = NOW() WHERE id = $2`,
             [uid, pgUserData.id]
           ).catch((e: any) => console.warn('[FranchiseAccessService] UID link notice:', e.message));
-          pgUserData.id = uid;
+          pgUserData.firebase_uid = uid;
         } else {
           // 0 matching records found
           if (targetApp === 'CUSTOMER') {
@@ -756,9 +756,9 @@ export class FranchiseAccessService {
         const riderRes = await query(
           `SELECT id, name, phone, email, status, is_online, branch_id, franchise_id, vehicle_type, vehicle_number
            FROM delivery_partners
-           WHERE id = $1
+           WHERE id = $1 OR user_id = $1 OR user_id = $2 OR (email IS NOT NULL AND LOWER(email) = LOWER($3))
            LIMIT 1`,
-          [pgUserData.id]
+          [pgUserData.id, uid, email || pgUserData.email || '']
         );
 
         if (riderRes.rows.length === 0) {

@@ -6,6 +6,7 @@ export interface AuthoritativePriceRequest {
   branchId: string;
   franchiseId?: string;
   productId: string;
+  itemName?: string;
   size?: string;
   crust?: string;
   addons?: Array<string | { id?: string; name?: string; price?: number }>;
@@ -119,7 +120,7 @@ export class AuthoritativePricingResolver {
     // 1. Fetch master catalog item for structure, variants, sizes, addons, and baseline price
     let masterItem: any = null;
     try {
-      masterItem = await POSService.getCatalogItem(productId);
+      masterItem = await POSService.getCatalogItem(productId, req.itemName);
     } catch (e: any) {
       console.warn(`[AuthoritativePricingResolver] Master catalog lookup notice for ${productId}:`, e.message);
     }
@@ -192,22 +193,42 @@ export class AuthoritativePricingResolver {
 
     // 3. Resolve size / variant pricing & validate sizes
     let sizePrice = 0;
-    const selectedSize = (req.size || '').toLowerCase().trim();
-    if (selectedSize) {
+    const rawSize = (req.size || '').toLowerCase().trim();
+    if (rawSize) {
       let matchedSize = false;
-      if (masterItem.sizes && typeof masterItem.sizes === 'object') {
-        const foundKey = Object.keys(masterItem.sizes).find(k => k.toLowerCase() === selectedSize);
+      const cleanTokens = rawSize.replace(/[^a-z0-9]/g, ' ').split(/\s+/).filter(Boolean);
+      const sizeTier = cleanTokens.find(t => ['regular', 'small', 'medium', 'large', 'xl', 'monster', 'standard'].includes(t)) || rawSize;
+
+      // Check if masterItem.sizes is an Array
+      if (Array.isArray(masterItem.sizes)) {
+        const foundSize = masterItem.sizes.find((s: any) => {
+          const sName = String(s.name || s.size || s.id || '').toLowerCase();
+          return sName === rawSize || sName === sizeTier || rawSize.includes(sName) || sName.includes(sizeTier);
+        });
+        if (foundSize && (foundSize.price != null || foundSize.basePrice != null)) {
+          sizePrice = Number(foundSize.price ?? foundSize.basePrice);
+          matchedSize = true;
+        }
+      } else if (masterItem.sizes && typeof masterItem.sizes === 'object') {
+        // masterItem.sizes is a key-value Record
+        const foundKey = Object.keys(masterItem.sizes).find(k => {
+          const lk = k.toLowerCase();
+          return lk === rawSize || lk === sizeTier || rawSize.includes(lk) || lk.includes(sizeTier);
+        });
         if (foundKey && masterItem.sizes[foundKey]?.price != null) {
           sizePrice = Number(masterItem.sizes[foundKey].price);
           matchedSize = true;
         }
       }
+
       if (!matchedSize && Array.isArray(masterItem.variants)) {
         const v = masterItem.variants.find((vr: any) => {
           if (typeof vr === 'string') {
-            return vr.toLowerCase().includes(selectedSize);
+            const lvr = vr.toLowerCase();
+            return lvr === rawSize || lvr === sizeTier || rawSize.includes(lvr) || lvr.includes(sizeTier);
           }
-          return (vr.name || vr.size || '').toLowerCase() === selectedSize;
+          const vrName = String(vr.name || vr.size || '').toLowerCase();
+          return vrName === rawSize || vrName === sizeTier || rawSize.includes(vrName) || vrName.includes(sizeTier);
         });
         if (v) {
           if (typeof v === 'string') {
@@ -225,6 +246,21 @@ export class AuthoritativePricingResolver {
           }
         }
       }
+
+      // If still not matched explicitly, check if sizeTier is a standard tier and inherit base price
+      if (!matchedSize && ['regular', 'small', 'medium', 'large', 'xl', 'monster', 'standard'].includes(sizeTier)) {
+        if (sizeTier === 'medium') {
+          sizePrice = masterBasePrice || basePrice;
+        } else if (sizeTier === 'regular' || sizeTier === 'small') {
+          sizePrice = masterBasePrice > 50 ? masterBasePrice - 50 : basePrice;
+        } else if (sizeTier === 'large' || sizeTier === 'xl') {
+          sizePrice = (masterBasePrice || basePrice) + 100;
+        } else {
+          sizePrice = masterBasePrice || basePrice;
+        }
+        matchedSize = true;
+      }
+
       if (!matchedSize) {
         throw new Error(`Invalid size "${req.size}" requested for product "${productName}".`);
       }
@@ -250,6 +286,9 @@ export class AuthoritativePricingResolver {
       'classic',
       'classic crust',
       'classic hand tossed',
+      'classic sourdough crust',
+      'sourdough',
+      'sourdough crust',
       'hand tossed',
       'normal',
       'normal crust',

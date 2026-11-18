@@ -225,8 +225,92 @@ export class NotificationEngine {
       }
     }
 
+    // ── 0b. Strict Target App Resolution & Customer Order Integrity Guard ──
+    let effectiveTargetApp = options.targetApp;
+    const isOperationalAlert =
+      options.category === 'alarm_actionable' ||
+      payload.data?.category === 'alarm_actionable' ||
+      payload.data?.type === 'NO_RIDER_PENDING_QUEUE' ||
+      payload.data?.type === 'NEW_ORDER' ||
+      payload.data?.type === 'RESTAURANT_NEW_ORDER_ALARM' ||
+      (payload.notification?.title || '').toLowerCase().includes('rider pending') ||
+      (payload.notification?.body || '').toLowerCase().includes('no riders') ||
+      (payload.notification?.body || '').toLowerCase().includes('requires delivery but no riders');
+
+    if (!effectiveTargetApp) {
+      if (isOperationalAlert) {
+        effectiveTargetApp = 'restaurant';
+      } else if (
+        options.category === 'pinned_live' ||
+        options.category === 'order_status' ||
+        (payload.data?.category as any) === 'pinned_live' ||
+        (payload.data?.category as any) === 'order_status' ||
+        payload.data?.role === 'customer'
+      ) {
+        effectiveTargetApp = 'customer';
+      }
+    }
+
+    // Server-Side Operational Alert Customer Isolation Guard:
+    // Operational alerts (rider shortage, kitchen alarms, dispatch queues) MUST NEVER be sent to customers!
+    if (isOperationalAlert) {
+      effectiveTargetApp = effectiveTargetApp || 'restaurant';
+      const cleanTargetUids: string[] = [];
+      for (const uid of targetUids) {
+        try {
+          const userRes = await pgPool.query(
+            `SELECT role, allowed_apps FROM app_users WHERE id = $1 LIMIT 1`,
+            [uid]
+          );
+          if (userRes.rows.length > 0) {
+            const r = (userRes.rows[0].role || '').toLowerCase();
+            const apps = Array.isArray(userRes.rows[0].allowed_apps) ? userRes.rows[0].allowed_apps : [];
+            if (r === 'customer' && !apps.includes('RESTAURANT_MANAGER') && !apps.includes('OWNER')) {
+              console.warn(`[NotificationEngine][Isolation] Excluded customer UID ${uid} from operational alert`);
+              continue;
+            }
+          }
+        } catch (_) {}
+        cleanTargetUids.push(uid);
+      }
+      targetUids = cleanTargetUids;
+      if (targetUids.length === 0) {
+        console.warn(`[NotificationEngine][Isolation] All recipients were customer accounts. Operational alert suppressed.`);
+        return { successCount: 0, failureCount: 0, tokensFound: 0, errors: ['customer_operational_suppressed'] };
+      }
+    }
+
+    // Customer Order Recipient Integrity Guard:
+    // If delivering customer order updates for orderId, strictly verify that each recipient is the customer who placed the order!
+    if (options.orderId && (effectiveTargetApp === 'customer' || options.category === 'pinned_live' || options.category === 'order_status')) {
+      try {
+        const orderRes = await pgPool.query(
+          `SELECT customer_id, user_id FROM canonical_orders WHERE id = $1 LIMIT 1`,
+          [options.orderId]
+        );
+        if (orderRes.rows.length > 0) {
+          const expectedCustomer = orderRes.rows[0].customer_id || orderRes.rows[0].user_id;
+          targetUids = targetUids.filter(uid => uid === expectedCustomer);
+          if (targetUids.length === 0) {
+            console.warn(`[NotificationEngine][Isolation] Dropped order notification for #${options.orderId}: target UIDs do not match ordering customer (${expectedCustomer}).`);
+            return { successCount: 0, failureCount: 0, tokensFound: 0, errors: ['customer_mismatch_suppressed'] };
+          }
+          // Explicitly tag payload with customer ownership for client-side cross-check
+          payload.data = {
+            ...(payload.data || {}),
+            targetApp: 'customer',
+            userId: expectedCustomer,
+            customerUid: expectedCustomer,
+            targetUserId: expectedCustomer
+          };
+        }
+      } catch (orderCheckErr: any) {
+        // Non-fatal if order query fails
+      }
+    }
+
     // ── 1. Resolve FCM tokens ─────────────────────────────────────────────────
-    const tokens = await this.resolveTokens(targetUids, options.targetApp);
+    const tokens = await this.resolveTokens(targetUids, effectiveTargetApp);
 
     const startTime = Date.now();
     const notificationId = options.orderId ? `notif_${options.orderId}_${Date.now()}` : `notif_${Date.now()}`;
@@ -377,8 +461,10 @@ export class NotificationEngine {
           webpush: payload.webpush,
         };
 
-        // Keep the visible APNs alert while Android receives data-only pushes for native operational UI.
-        if (!isShiftTransition && !isNativeManagedStaffAlarm && (!isDataOnlyCategory || isUrgentStaffApp) && (payload.notification || sanitizedData.title)) {
+        // For operational alarms (rider pending, kitchen alert, shift changes, etc.), NEVER attach top-level notification block!
+        // Top-level notification blocks force Google Play Services to display raw status bar notifications without native filtering.
+        const shouldOmitNotificationBlock = isOperationalAlert || isShiftTransition || isNativeManagedStaffAlarm || isDataOnlyCategory;
+        if (!shouldOmitNotificationBlock && (payload.notification || sanitizedData.title)) {
           message.notification = payload.notification || {
             title: sanitizedData.title || 'Olive Pizza Alert',
             body: sanitizedData.body || 'Immediate action required'
@@ -646,11 +732,33 @@ export class NotificationEngine {
           const tokenRole = (r.role || '').toLowerCase().trim();
 
           // CRITICAL APP TARGET ISOLATION:
-          // For restaurant operational targetApp, only tokens registered from restaurant app are allowed.
-          if (target === 'restaurant' || target === 'restaurant_manager') {
-            if (app === 'owner' || app === 'customer' || app === 'delivery') {
+          // 1. Operational non-customer targets must NEVER deliver to customer apps or customer accounts!
+          if (target !== 'customer') {
+            if (app === 'customer' || tokenRole === 'customer') {
               return false;
             }
+          }
+
+          // 2. For restaurant operational targetApp, only tokens registered from restaurant app are allowed.
+          if (target === 'restaurant' || target === 'restaurant_manager') {
+            if (app !== 'restaurant' && app !== 'restaurant_manager') {
+              return false;
+            }
+            if (tokenRole === 'customer' || tokenRole === 'delivery_partner' || tokenRole === 'rider') {
+              return false;
+            }
+            return true;
+          }
+
+          // 3. For customer targetApp, STRICTLY deliver ONLY to tokens registered by the customer app!
+          if (target === 'customer') {
+            if (app !== 'customer') {
+              return false;
+            }
+            if (tokenRole && ['restaurant_manager', 'manager', 'kitchen_staff', 'rider', 'delivery_partner', 'pos_operator'].includes(tokenRole)) {
+              return false;
+            }
+            return true;
           }
 
           if (!target || target === 'all') return true;
@@ -674,14 +782,14 @@ export class NotificationEngine {
           if (target === 'owner' && app === 'owner') return true;
           // Match pos
           if (target === 'pos' && app === 'pos') return true;
-          // Match customer
-          if (target === 'customer' && (app === 'customer' || !app)) return true;
+          // Match customer: MUST explicitly be tagged as customer
+          if (target === 'customer') return app === 'customer';
 
           // Reject if explicitly tagged for a different app
           if (app && app !== target) return false;
 
-          // For staff / delivery / owner apps, reject untagged legacy tokens to prevent cross-app leakage
-          return target === 'customer';
+          // Reject untagged legacy tokens to prevent cross-app leakage
+          return false;
         });
       }
 
@@ -874,6 +982,26 @@ export class NotificationEngine {
     const cleanTargetF = normF(cleanFranchiseId);
 
     try {
+      // 0. Authoritative Primary Query: PostgreSQL app_users table
+      try {
+        let pgUserSql = `SELECT id, franchise_id, allowed_apps, role 
+                         FROM app_users 
+                         WHERE is_active = TRUE 
+                           AND (branch_id = $1 OR branch_id = 'all')
+                           AND (role = ANY($2) OR allowed_apps ? 'RESTAURANT_MANAGER' OR allowed_apps ? 'RESTAURANT')`;
+        const pgUserParams: any[] = [cleanBranchId, roles];
+        if (cleanFranchiseId) {
+          pgUserSql += ` AND (franchise_id = $3 OR franchise_id = $4 OR franchise_id IS NULL OR franchise_id = '' OR franchise_id = 'fra_primary')`;
+          pgUserParams.push(cleanFranchiseId, cleanTargetF);
+        }
+        const pgUserRes = await pgPool.query(pgUserSql, pgUserParams);
+        pgUserRes.rows.forEach((r: any) => {
+          if (r.id) uidsSet.add(r.id);
+        });
+      } catch (pgUserErr: any) {
+        console.warn('[NotificationEngine] PostgreSQL app_users staff lookup notice:', pgUserErr.message);
+      }
+
       // 1. Query Firestore users by branchId + role
       for (const r of roles) {
         const snap = await db.collection('users')
@@ -943,6 +1071,33 @@ export class NotificationEngine {
     for (const uid of uidsSet) {
       try {
         let isAuthorized = false;
+
+        // 0. Primary Check: PostgreSQL app_users table
+        const pgCheck = await pgPool.query(
+          `SELECT email, role, branch_id, franchise_id, allowed_apps, is_active FROM app_users WHERE id = $1 LIMIT 1`,
+          [uid]
+        ).catch(() => ({ rows: [] }));
+
+        if (pgCheck.rows.length > 0) {
+          const u = pgCheck.rows[0];
+          const email = (u.email || '').toLowerCase().trim();
+          const role = (u.role || '').toLowerCase().trim();
+          const apps = Array.isArray(u.allowed_apps) ? u.allowed_apps.map((a: string) => a.toUpperCase()) : [];
+
+          if (FORBIDDEN_EMAILS.has(email) || (FORBIDDEN_ROLES.has(role) && !apps.includes('RESTAURANT_MANAGER'))) {
+            continue;
+          }
+
+          if (u.is_active !== false && (ALLOWED_STAFF_ROLES.has(role) || apps.includes('RESTAURANT_MANAGER') || apps.includes('RESTAURANT'))) {
+            const userF = normF(u.franchise_id);
+            const userB = (u.branch_id || '').trim();
+            const branchMatches = !cleanBranchId || userB === cleanBranchId || userB === 'all';
+            const franchiseMatches = !cleanTargetF || !userF || userF === cleanTargetF || u.franchise_id === 'all' || u.franchise_id === 'fra_primary';
+            if (branchMatches && franchiseMatches) {
+              isAuthorized = true;
+            }
+          }
+        }
 
         // 1. Check users collection
         const uDoc = await db.collection('users').doc(uid).get().catch(() => null);

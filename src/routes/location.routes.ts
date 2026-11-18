@@ -80,100 +80,178 @@ router.get('/serviceable-cities', publicLimiter, async (_req: Request, res: Resp
 
     const cityMap = new Map<string, CityInfo>();
 
-    // 1. Query franchises (branch records) collection
-    const franchisesSnap = await adminDb.collection('franchises').get();
-    for (const doc of franchisesSnap.docs) {
-      const data = doc.data();
-      const statusLower = String(data.status || '').toLowerCase();
-      if (
-        data.isActive === false ||
-        statusLower === 'deleted' ||
-        statusLower === 'deactivated' ||
-        statusLower === 'suspended' ||
-        statusLower === 'planned'
-      ) {
-        continue;
-      }
+    // 1. Query PostgreSQL restaurant_branches first (Authoritative, resilient to Firestore quotas)
+    try {
+      const { query } = await import('../lib/db.js');
+      const pgBranches = await query(`
+        SELECT id, franchise_id, name, address, latitude, longitude, delivery_settings, is_open
+        FROM restaurant_branches
+        WHERE is_open = true;
+      `);
+      for (const row of pgBranches.rows) {
+        const rawAddress = String(row.address || '');
+        // Dynamically resolve city from address or branch name for any present or future franchise
+        const addressMatch = rawAddress.match(/(?:,\s*)([A-Za-z\s]+)(?:,\s*Chhattisgarh|\s*\d{6}|$)/i);
+        const rawCity = addressMatch?.[1]?.trim() || 
+          (row.name ? row.name.replace(/Olive\s*Pizza\s*[-—(\s]*(.*?)[)\s]*$/i, '$1').trim() : '') ||
+          'Rajnandgaon';
 
-      const rawCity = (data.city || '').trim();
-      if (!rawCity) continue;
+        const cityKey = rawCity.toLowerCase();
+        const lat = Number(row.latitude);
+        const lng = Number(row.longitude);
+        const radius = Number(
+          row.delivery_settings?.radiusKm ??
+          row.delivery_settings?.maxDeliveryRadiusKm ??
+          15
+        );
+        const state = 'Chhattisgarh';
+        const branchName = row.name || `Olive Pizza ${rawCity}`;
 
-      const cityKey = rawCity.toLowerCase();
-      const lat = Number(data.lat ?? data.coordinates?.lat ?? data.location?.lat);
-      const lng = Number(data.lng ?? data.coordinates?.lng ?? data.location?.lng);
-      const radius = Number(
-        data.maxDeliveryRadiusKm ||
-        data.deliverySettings?.maxDeliveryRadiusKm ||
-        data.deliveryRadiusKm ||
-        data.deliveryRadius ||
-        15
-      );
-      const state = data.state || 'Chhattisgarh';
-      const branchName = data.name || `Olive Pizza ${rawCity}`;
-
-      const rawPopular = Array.isArray(data.popularLocalities) && data.popularLocalities.length > 0
-        ? data.popularLocalities
-        : Array.isArray(data.popularLocations) && data.popularLocations.length > 0
-          ? data.popularLocations
-          : [];
-
-      if (!isNaN(lat) && !isNaN(lng)) {
-        const deltaLat = radius / 110.574;
-        const deltaLng = radius / (111.320 * Math.cos((lat * Math.PI) / 180));
-        const viewbox = [
-          Number((lng - deltaLng).toFixed(6)),
-          Number((lat + deltaLat).toFixed(6)),
-          Number((lng + deltaLng).toFixed(6)),
-          Number((lat - deltaLat).toFixed(6)),
-        ];
-
-        const branchInfo = {
-          id: doc.id,
-          name: branchName,
-          lat,
-          lng,
-          deliveryRadiusKm: radius,
-        };
-
-        if (!cityMap.has(cityKey)) {
-          cityMap.set(cityKey, {
-            id: `city_${cityKey}`,
-            city: rawCity,
-            name: rawCity,
-            state,
-            country: 'India',
-            center: { lat, lng },
-            deliveryRadiusKm: radius,
-            viewbox,
-            activeBranches: 1,
-            branchNames: [branchName],
-            branches: [branchInfo],
-            popularLocalities: [...rawPopular],
-            serviceable: true,
-          });
-        } else {
-          const existing = cityMap.get(cityKey)!;
-          existing.activeBranches += 1;
-          existing.branchNames.push(branchName);
-          existing.branches.push(branchInfo);
-          existing.deliveryRadiusKm = Math.max(existing.deliveryRadiusKm, radius);
-          existing.viewbox = [
-            Math.min(existing.viewbox[0], viewbox[0]),
-            Math.max(existing.viewbox[1], viewbox[1]),
-            Math.max(existing.viewbox[2], viewbox[2]),
-            Math.min(existing.viewbox[3], viewbox[3]),
+        if (!isNaN(lat) && !isNaN(lng)) {
+          const deltaLat = radius / 110.574;
+          const deltaLng = radius / (111.320 * Math.cos((lat * Math.PI) / 180));
+          const viewbox = [
+            Number((lng - deltaLng).toFixed(6)),
+            Number((lat + deltaLat).toFixed(6)),
+            Number((lng + deltaLng).toFixed(6)),
+            Number((lat - deltaLat).toFixed(6)),
           ];
-          if (rawPopular.length > 0) {
-            const existingIds = new Set(existing.popularLocalities.map((p) => (p.title || '').toLowerCase()));
-            for (const item of rawPopular) {
-              if (!existingIds.has((item.title || '').toLowerCase())) {
-                existing.popularLocalities.push(item);
-                existingIds.add((item.title || '').toLowerCase());
+
+          const branchInfo = {
+            id: row.id,
+            name: branchName,
+            lat,
+            lng,
+            deliveryRadiusKm: radius,
+          };
+
+          if (!cityMap.has(cityKey)) {
+            cityMap.set(cityKey, {
+              id: `city_${cityKey}`,
+              city: rawCity,
+              name: rawCity,
+              state,
+              country: 'India',
+              center: { lat, lng },
+              deliveryRadiusKm: radius,
+              viewbox,
+              activeBranches: 1,
+              branchNames: [branchName],
+              branches: [branchInfo],
+              popularLocalities: [],
+              serviceable: true,
+            });
+          } else {
+            const existing = cityMap.get(cityKey)!;
+            existing.activeBranches += 1;
+            existing.branchNames.push(branchName);
+            existing.branches.push(branchInfo);
+            existing.deliveryRadiusKm = Math.max(existing.deliveryRadiusKm, radius);
+          }
+        }
+      }
+    } catch (pgErr: any) {
+      console.warn('[LocationRoutes] Notice querying PostgreSQL restaurant_branches:', pgErr.message);
+    }
+
+    // 2. Query Firestore franchises (Fallback & enrichment with popularLocalities)
+    try {
+      const franchisesSnap = await adminDb.collection('franchises').get();
+      for (const doc of franchisesSnap.docs) {
+        const data = doc.data();
+        const statusLower = String(data.status || '').toLowerCase();
+        if (
+          data.isActive === false ||
+          statusLower === 'deleted' ||
+          statusLower === 'deactivated' ||
+          statusLower === 'suspended' ||
+          statusLower === 'planned'
+        ) {
+          continue;
+        }
+
+        const rawCity = (data.city || '').trim();
+        if (!rawCity) continue;
+
+        const cityKey = rawCity.toLowerCase();
+        const lat = Number(data.lat ?? data.coordinates?.lat ?? data.location?.lat);
+        const lng = Number(data.lng ?? data.coordinates?.lng ?? data.location?.lng);
+        const radius = Number(
+          data.maxDeliveryRadiusKm ||
+          data.deliverySettings?.maxDeliveryRadiusKm ||
+          data.deliveryRadiusKm ||
+          data.deliveryRadius ||
+          15
+        );
+        const state = data.state || 'Chhattisgarh';
+        const branchName = data.name || `Olive Pizza ${rawCity}`;
+
+        const rawPopular = Array.isArray(data.popularLocalities) && data.popularLocalities.length > 0
+          ? data.popularLocalities
+          : Array.isArray(data.popularLocations) && data.popularLocations.length > 0
+            ? data.popularLocations
+            : [];
+
+        if (!isNaN(lat) && !isNaN(lng)) {
+          const deltaLat = radius / 110.574;
+          const deltaLng = radius / (111.320 * Math.cos((lat * Math.PI) / 180));
+          const viewbox = [
+            Number((lng - deltaLng).toFixed(6)),
+            Number((lat + deltaLat).toFixed(6)),
+            Number((lng + deltaLng).toFixed(6)),
+            Number((lat - deltaLat).toFixed(6)),
+          ];
+
+          const branchInfo = {
+            id: doc.id,
+            name: branchName,
+            lat,
+            lng,
+            deliveryRadiusKm: radius,
+          };
+
+          if (!cityMap.has(cityKey)) {
+            cityMap.set(cityKey, {
+              id: `city_${cityKey}`,
+              city: rawCity,
+              name: rawCity,
+              state,
+              country: 'India',
+              center: { lat, lng },
+              deliveryRadiusKm: radius,
+              viewbox,
+              activeBranches: 1,
+              branchNames: [branchName],
+              branches: [branchInfo],
+              popularLocalities: [...rawPopular],
+              serviceable: true,
+            });
+          } else {
+            const existing = cityMap.get(cityKey)!;
+            existing.activeBranches += 1;
+            existing.branchNames.push(branchName);
+            existing.branches.push(branchInfo);
+            existing.deliveryRadiusKm = Math.max(existing.deliveryRadiusKm, radius);
+            existing.viewbox = [
+              Math.min(existing.viewbox[0], viewbox[0]),
+              Math.max(existing.viewbox[1], viewbox[1]),
+              Math.max(existing.viewbox[2], viewbox[2]),
+              Math.min(existing.viewbox[3], viewbox[3]),
+            ];
+            if (rawPopular.length > 0) {
+              const existingIds = new Set(existing.popularLocalities.map((p: any) => (p.title || '').toLowerCase()));
+              for (const item of rawPopular) {
+                if (!existingIds.has((item.title || '').toLowerCase())) {
+                  existing.popularLocalities.push(item);
+                  existingIds.add((item.title || '').toLowerCase());
+                }
               }
             }
           }
         }
       }
+    } catch (fsErr: any) {
+      console.warn('[LocationRoutes] Notice querying Firestore franchises (using PG authoritative):', fsErr.message);
     }
 
     // 2. Also check franchise_entities collection if franchises had no branches for an active franchise
@@ -331,33 +409,55 @@ router.get('/popular-locations', async (req: Request, res: Response): Promise<vo
     const cityName = String(req.query.city || '').trim().toLowerCase();
     let cities = citiesCache.get<any[]>('serviceable_cities');
     if (!cities) {
-      // Trigger internal resolution by querying franchises
-      const franchisesSnap = await adminDb.collection('franchises').get();
-      const cityMap = new Map<string, any>();
-      for (const doc of franchisesSnap.docs) {
-        const data = doc.data();
-        const dataStatus = String(data.status || '').toLowerCase();
-        if (
-          data.isActive === false ||
-          dataStatus === 'deleted' ||
-          dataStatus === 'deactivated' ||
-          dataStatus === 'suspended' ||
-          dataStatus === 'planned'
-        ) {
-          continue;
+      try {
+        const franchisesSnap = await adminDb.collection('franchises').get();
+        const cityMap = new Map<string, any>();
+        for (const doc of franchisesSnap.docs) {
+          const data = doc.data();
+          const dataStatus = String(data.status || '').toLowerCase();
+          if (
+            data.isActive === false ||
+            dataStatus === 'deleted' ||
+            dataStatus === 'deactivated' ||
+            dataStatus === 'suspended' ||
+            dataStatus === 'planned'
+          ) {
+            continue;
+          }
+          const rawCity = (data.city || '').trim();
+          if (!rawCity) continue;
+          const cityKey = rawCity.toLowerCase();
+          const popular = Array.isArray(data.popularLocalities) ? data.popularLocalities : [];
+          if (!cityMap.has(cityKey)) {
+            cityMap.set(cityKey, {
+              name: rawCity,
+              popularLocalities: popular,
+            });
+          }
         }
-        const rawCity = (data.city || '').trim();
-        if (!rawCity) continue;
-        const cityKey = rawCity.toLowerCase();
-        const popular = Array.isArray(data.popularLocalities) ? data.popularLocalities : [];
-        if (!cityMap.has(cityKey)) {
-          cityMap.set(cityKey, {
-            name: rawCity,
-            popularLocalities: popular,
-          });
+        cities = Array.from(cityMap.values());
+      } catch (fsErr: any) {
+        // Fallback to PostgreSQL
+        try {
+          const { query } = await import('../lib/db.js');
+          const pgBranches = await query(`SELECT name, address FROM restaurant_branches WHERE is_open = true`);
+          const cityMap = new Map<string, any>();
+          for (const row of pgBranches.rows) {
+            const rawAddress = String(row.address || '');
+            const addressMatch = rawAddress.match(/(?:,\s*)([A-Za-z\s]+)(?:,\s*Chhattisgarh|\s*\d{6}|$)/i);
+            const rawCity = addressMatch?.[1]?.trim() || 
+              (row.name ? row.name.replace(/Olive\s*Pizza\s*[-—(\s]*(.*?)[)\s]*$/i, '$1').trim() : '') ||
+              'Rajnandgaon';
+            const cityKey = rawCity.toLowerCase();
+            if (!cityMap.has(cityKey)) {
+              cityMap.set(cityKey, { name: rawCity, popularLocalities: [] });
+            }
+          }
+          cities = Array.from(cityMap.values());
+        } catch {
+          cities = [];
         }
       }
-      cities = Array.from(cityMap.values());
     }
 
     if (cityName && cities) {

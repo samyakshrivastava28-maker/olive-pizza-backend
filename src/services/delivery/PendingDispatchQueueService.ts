@@ -101,29 +101,33 @@ export class PendingDispatchQueueService {
       });
     } catch (_) {}
 
-    // Alert branch restaurant managers
-    try {
-      notificationEngine.resolveBranchStaff(branchId).then((staffUids: string[]) => {
-        if (staffUids && staffUids.length > 0) {
-          notificationEngine.sendBulk(staffUids, {
-            notification: {
-              title: '⚠️ Delivery Rider Pending',
-              body: `Order #${orderId} requires delivery but no riders are currently in radius. System is auto-retrying.`
-            },
-            data: {
-              type: 'NO_RIDER_PENDING_QUEUE',
+    // Alert branch restaurant managers (strictly ONCE per order, DATA-ONLY for staff, never customer-visible)
+    if (Number(row.attempt_count) <= 1) {
+      try {
+        notificationEngine.resolveBranchStaff(branchId, franchiseId).then((staffUids: string[]) => {
+          if (staffUids && staffUids.length > 0) {
+            notificationEngine.sendBulk(staffUids, {
+              data: {
+                type: 'NO_RIDER_PENDING_QUEUE',
+                category: 'alarm_actionable',
+                targetApp: 'restaurant',
+                targetRole: 'restaurant_manager',
+                orderId,
+                queueId: row.id,
+                title: '⚠️ Delivery Rider Pending',
+                body: `Order #${orderId} requires delivery but no riders are currently in radius. System is auto-retrying.`
+              }
+            }, {
+              category: 'alarm_actionable',
+              priority: 'high',
               orderId,
-              queueId: row.id
-            }
-          }, {
-            category: 'alarm_actionable',
-            priority: 'high',
-            orderId,
-            targetApp: 'restaurant'
-          }).catch(() => {});
-        }
-      }).catch(() => {});
-    } catch (_) {}
+              targetApp: 'restaurant',
+              eventId: `NO_RIDER_ALERT:${orderId}`
+            }).catch(() => {});
+          }
+        }).catch(() => {});
+      } catch (_) {}
+    }
 
     return {
       queued: true,

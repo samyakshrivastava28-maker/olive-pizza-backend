@@ -1,5 +1,5 @@
 import '../config/env.js';
-import { adminAuth } from '../config/firebase.js';
+import { adminAuth, adminDb } from '../config/firebase.js';
 import { query } from '../config/postgres.js';
 import axios from 'axios';
 
@@ -28,18 +28,71 @@ async function runE2ETest() {
   console.log('Multi-Franchise Isolation, and Rider Delivery Handshake.');
   console.log('================================================================\n');
 
-  // STEP 0: Reset test state in PostgreSQL
-  console.log('[Step 0] Cleaning test fixtures in PostgreSQL...');
+  // STEP 0: Reset test state in PostgreSQL & Firestore
+  console.log('[Step 0] Cleaning test fixtures in PostgreSQL and Firestore...');
   await query(`
     UPDATE canonical_orders 
     SET order_status = 'DELIVERED' 
     WHERE customer_id = 'usr_e2e_cust_01' 
       AND order_status NOT IN ('DELIVERED', 'CANCELLED', 'REJECTED', 'FAILED')
   `);
+
+  // Clean active Firestore test orders to prevent ACTIVE_ORDER_EXISTS collision
+  try {
+    const lingeringFsOrders = await adminDb.collection('orders')
+      .where('userId', '==', 'usr_e2e_cust_01')
+      .get();
+
+    for (const doc of lingeringFsOrders.docs) {
+      const d = doc.data();
+      const st = (d.status || '').toLowerCase();
+      if (!['delivered', 'cancelled', 'rejected', 'failed'].includes(st)) {
+        await doc.ref.update({
+          status: 'delivered',
+          order_status: 'DELIVERED',
+          live_lifecycle: 'TERMINAL',
+          updatedAt: new Date().toISOString()
+        }).catch(() => {});
+      }
+    }
+  } catch (fsErr: any) {
+    console.warn('[Step 0] Firestore cleanup notice:', fsErr.message);
+  }
   await query(`
-    UPDATE delivery_partners 
-    SET active_order_id = NULL, is_online = true, status = 'APPROVED'
-    WHERE id IN ('rider_01', 'rider_02', 'rider_bsp_01')
+    UPDATE delivery_partners
+    SET is_online = false, active_order_id = NULL
+    WHERE id NOT IN ('rider_01', 'rider_02', 'rider_bsp_01');
+  `);
+  await query(`
+    INSERT INTO delivery_partners (
+      id, name, phone, email, franchise_id, branch_id, vehicle_type, vehicle_number, is_online, status, current_lat, current_lng, last_location_time, active_order_id, user_id, updated_at
+    ) VALUES 
+      ('rider_01', 'Rahul Sharma', '+91 98271 22334', 'rahul.rider@olivepizza.in', 'fra_rajnandgaon', 'main_branch', 'motorcycle', 'CG-08-AA-1111', true, 'APPROVED', 21.0960, 81.0310, NOW(), NULL, 'rider_01', NOW()),
+      ('rider_02', 'Amit Verma', '+91 98272 55667', 'amit.rider@olivepizza.in', 'fra_rajnandgaon', 'main_branch', 'motorcycle', 'CG-08-AA-2222', true, 'APPROVED', 21.0970, 81.0320, NOW(), NULL, 'rider_02', NOW()),
+      ('rider_bsp_01', 'Bilaspur Rider', '+91 98273 99999', 'bsp.rider@olivepizza.in', 'fra_bilaspur', 'branch_bsp_main', 'motorcycle', 'CG-10-BB-3333', true, 'APPROVED', 22.0797, 82.1409, NOW(), NULL, 'rider_bsp_01', NOW())
+    ON CONFLICT (id) DO UPDATE SET
+      branch_id = EXCLUDED.branch_id,
+      franchise_id = EXCLUDED.franchise_id,
+      is_online = true,
+      status = 'APPROVED',
+      active_order_id = NULL,
+      current_lat = EXCLUDED.current_lat,
+      current_lng = EXCLUDED.current_lng,
+      last_location_time = NOW(),
+      updated_at = NOW()
+  `);
+  await query(`
+    INSERT INTO delivery_locations (delivery_partner_id, active_order_id, latitude, longitude, online_status, last_updated)
+    VALUES 
+      ('rider_01', NULL, 21.0960, 81.0310, true, NOW()),
+      ('rider_02', NULL, 21.0970, 81.0320, true, NOW()),
+      ('rider_bsp_01', NULL, 22.0797, 82.1409, true, NOW())
+    ON CONFLICT (delivery_partner_id) DO UPDATE SET
+      active_order_id = NULL,
+      latitude = EXCLUDED.latitude,
+      longitude = EXCLUDED.longitude,
+      online_status = true,
+      last_updated = NOW()
   `);
   console.log('✅ Test fixtures initialized.\n');
 
@@ -75,7 +128,7 @@ async function runE2ETest() {
   // Ensure test riders are available in PostgreSQL
   await query(`
     UPDATE delivery_partners
-    SET active_order_id = NULL, is_online = true, status = 'APPROVED'
+    SET active_order_id = NULL, is_online = true, status = 'APPROVED', last_location_time = NOW(), updated_at = NOW()
     WHERE id IN ('rider_01', 'rider_02', 'rider_bsp_01')
   `);
   console.log('✅ Test delivery partners reset to online & unassigned.\n');
@@ -157,10 +210,10 @@ async function runE2ETest() {
   });
   console.log('Status Ready Response:', readyRes.status, readyRes.data);
 
-  console.log('Waiting for asynchronous RiderDispatchEngine to lock & assign rider (polling up to 10s)...');
+  console.log('Waiting for asynchronous RiderDispatchEngine to lock & assign rider (polling up to 30s for Layerbase latency)...');
   let assignedRiderId: string | null = null;
   let pgOrderCheck3: any = null;
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  for (let attempt = 1; attempt <= 30; attempt++) {
     await sleep(1000);
     const res = await query(
       'SELECT id, order_status, delivery_partner_id, delivery_partner_name, delivery_partner_phone, partner_assigned_at FROM canonical_orders WHERE id = $1',
@@ -171,7 +224,7 @@ async function runE2ETest() {
       assignedRiderId = res.rows[0].delivery_partner_id;
       break;
     }
-    console.log(`  ...polling rider assignment (attempt ${attempt}/10)`);
+    console.log(`  ...polling rider assignment (attempt ${attempt}/30)`);
   }
   console.log('PostgreSQL Order After Ready/Dispatch:', pgOrderCheck3?.rows[0]);
   console.log(`Assigned Rider ID: ${assignedRiderId} (${pgOrderCheck3?.rows[0]?.delivery_partner_name})`);
@@ -230,6 +283,21 @@ async function runE2ETest() {
   const pgOrderCheck4 = await query('SELECT order_status FROM canonical_orders WHERE id = $1', [rjnOrderId]);
   console.log('Order Status After Pickup:', pgOrderCheck4.rows[0]?.order_status);
 
+  // Rider arrives at customer & updates live GPS within 50m geofence
+  console.log('Rider arriving at customer location...');
+  await axios.post(`${BASE_URL}/api/delivery/rider/location`, {
+    lat: 21.0974,
+    lng: 81.0347,
+    activeOrderId: rjnOrderId
+  }, {
+    headers: { Authorization: `Bearer ${assignedRiderToken}` }
+  });
+  await axios.post(`${BASE_URL}/api/delivery/rider/orders/${rjnOrderId}/action`, {
+    action: 'ARRIVED_AT_CUSTOMER'
+  }, {
+    headers: { Authorization: `Bearer ${assignedRiderToken}` }
+  });
+
   // Rider collects cash for COD order
   console.log('Rider collecting COD payment...');
   const cashCollectRes = await axios.post(`${BASE_URL}/api/payment/cod/cash-collect`, {
@@ -266,10 +334,25 @@ async function runE2ETest() {
   console.log('Canonical Bill State:', billCheck.rows[0]);
   console.log('✅ Complete rider delivery lifecycle verified.\n');
 
+  // Allow remote PostgreSQL commit and Firestore projection to settle before placing next order
+  await sleep(1500);
+
   // STEP 6: Multi-Franchise Isolation Test (Bilaspur vs Rajnandgaon)
   console.log('================================================================');
   console.log('[Step 6] Multi-Franchise Isolation & Auto Dispatch (Bilaspur Branch)');
   console.log('================================================================');
+
+  // Refresh live heartbeat and location timestamp for Bilaspur rider before dispatch
+  await query(`
+    UPDATE delivery_partners
+    SET is_online = true, status = 'APPROVED', active_order_id = NULL, last_location_time = NOW(), updated_at = NOW()
+    WHERE id = 'rider_bsp_01';
+  `);
+  await query(`
+    UPDATE delivery_locations
+    SET online_status = true, active_order_id = NULL, last_updated = NOW()
+    WHERE delivery_partner_id = 'rider_bsp_01';
+  `);
 
   const bspOrderPayload = {
     items: [
@@ -335,9 +418,9 @@ async function runE2ETest() {
     headers: { Authorization: `Bearer ${bspManagerToken}` }
   });
 
-  console.log('Waiting for Bilaspur auto-rider dispatch (polling up to 10s)...');
+  console.log('Waiting for Bilaspur auto-rider dispatch (polling up to 30s for Layerbase latency)...');
   let pgBspCheck: any = null;
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  for (let attempt = 1; attempt <= 30; attempt++) {
     await sleep(1000);
     const res = await query(
       'SELECT id, order_status, delivery_partner_id, delivery_partner_name, branch_id FROM canonical_orders WHERE id = $1',
@@ -347,7 +430,7 @@ async function runE2ETest() {
       pgBspCheck = res;
       break;
     }
-    console.log(`  ...polling Bilaspur rider assignment (attempt ${attempt}/10)`);
+    console.log(`  ...polling Bilaspur rider assignment (attempt ${attempt}/30)`);
   }
   console.log('PostgreSQL Bilaspur Order Dispatch:', pgBspCheck?.rows[0]);
   if (pgBspCheck?.rows[0]?.delivery_partner_id !== 'rider_bsp_01') {
@@ -363,6 +446,22 @@ async function runE2ETest() {
   await axios.post(`${BASE_URL}/api/delivery/rider/orders/${bspOrderId}/pickup`, {}, {
     headers: { Authorization: `Bearer ${bspRiderToken}` }
   });
+
+  // Bilaspur Rider arrives at customer & updates live GPS within 50m geofence
+  console.log('Bilaspur Rider arriving at customer location...');
+  await axios.post(`${BASE_URL}/api/delivery/rider/location`, {
+    lat: 22.0797,
+    lng: 82.1409,
+    activeOrderId: bspOrderId
+  }, {
+    headers: { Authorization: `Bearer ${bspRiderToken}` }
+  });
+  await axios.post(`${BASE_URL}/api/delivery/rider/orders/${bspOrderId}/action`, {
+    action: 'ARRIVED_AT_CUSTOMER'
+  }, {
+    headers: { Authorization: `Bearer ${bspRiderToken}` }
+  });
+
   // Bilaspur Rider collects cash for COD order
   console.log('Bilaspur Rider collecting COD payment...');
   const bspOrderData = await query('SELECT total_amount FROM canonical_orders WHERE id = $1', [bspOrderId]);
