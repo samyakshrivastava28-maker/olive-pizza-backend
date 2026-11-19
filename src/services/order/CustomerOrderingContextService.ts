@@ -97,14 +97,20 @@ export class CustomerOrderingContextService {
         WHERE is_open = true;
       `);
       for (const row of pgBranches.rows) {
-        const bLat = Number(row.latitude);
-        const bLng = Number(row.longitude);
-        if (!isNaN(bLat) && !isNaN(bLng)) {
-          const maxRadius = Number(row.delivery_settings?.radiusKm ?? row.delivery_settings?.maxDeliveryRadiusKm ?? 15);
+        let bLat = Number(row.latitude);
+        let bLng = Number(row.longitude);
+        // Canonical fallback coordinates for Rajnandgaon HQ aliases if not populated in DB row
+        if ((isNaN(bLat) || isNaN(bLng) || (bLat === 0 && bLng === 0)) && (row.id === 'main_branch' || row.id === 'branch_rjn_main')) {
+          bLat = 21.0974;
+          bLng = 81.0347;
+        }
+        if (!isNaN(bLat) && !isNaN(bLng) && !(bLat === 0 && bLng === 0)) {
+          // Canonical default delivery radius is 12 km per project specification
+          const maxRadius = Number(row.delivery_settings?.radiusKm ?? row.delivery_settings?.maxDeliveryRadiusKm ?? 12);
           seenBranchIds.add(row.id);
           branches.push({
             id: row.id,
-            franchiseId: row.franchise_id,
+            franchiseId: row.franchise_id || 'fra_rajnandgaon',
             name: row.name || 'Olive Pizza Branch',
             lat: bLat,
             lng: bLng,
@@ -113,101 +119,9 @@ export class CustomerOrderingContextService {
         }
       }
     } catch (pgErr: any) {
-      console.warn('[CustomerOrderingContext] Warning reading restaurant_branches from PG:', pgErr.message);
-    }
-
-    if (branches.length === 0) {
-      try {
-        // 1. Fetch active branches across franchises collection
-        const franchisesSnap = await withTimeout(adminDb.collection('franchises').get(), 'orderingCtxFranchises', 1500);
-        for (const bDoc of franchisesSnap.docs) {
-          const bData = bDoc.data();
-          const bStatus = String(bData.status || '').toLowerCase();
-          if (
-            bData.isActive === false ||
-            bStatus === 'deleted' ||
-            bStatus === 'deactivated' ||
-            bStatus === 'suspended' ||
-            bStatus === 'planned'
-          ) {
-            continue;
-          }
-
-          const bLat = Number(bData.lat ?? bData.coordinates?.lat ?? bData.location?.lat);
-          const bLng = Number(bData.lng ?? bData.coordinates?.lng ?? bData.location?.lng);
-          if (!isNaN(bLat) && !isNaN(bLng)) {
-            const maxRadius = Number(
-              bData.deliveryRadiusKm ||
-              bData.maxDeliveryRadiusKm ||
-              bData.deliverySettings?.maxDeliveryRadiusKm ||
-              bData.deliveryRadius ||
-              15
-            );
-
-            seenBranchIds.add(bDoc.id);
-            branches.push({
-              id: bDoc.id,
-              franchiseId: bData.franchiseId || bDoc.id,
-              name: bData.name || 'Olive Pizza Branch',
-              lat: bLat,
-              lng: bLng,
-              deliveryRadiusKm: maxRadius
-            });
-          }
-        }
-      } catch (err) {
-        console.warn('[CustomerOrderingContext] Warning reading franchises snapshot:', err);
-      }
-
-      // 2. Also check franchise_entities collection if available
-      try {
-        const entitiesSnap = await withTimeout(adminDb.collection('franchise_entities').get(), 'orderingCtxEntities', 1500);
-        if (!entitiesSnap) throw new Error('Firestore franchise_entities lookup timed out');
-        for (const eDoc of entitiesSnap.docs) {
-          const eData = eDoc.data();
-          const eStatus = String(eData.status || '').toLowerCase();
-          if (
-            eData.isActive === false ||
-            eStatus === 'deleted' ||
-            eStatus === 'deactivated' ||
-            eStatus === 'suspended' ||
-            eStatus === 'planned'
-          ) {
-            continue;
-          }
-
-          const bId = eData.mainBranchId || eDoc.id;
-          if (seenBranchIds.has(bId)) continue;
-
-          const eLat = Number(eData.lat ?? eData.coordinates?.lat ?? eData.location?.lat);
-          const eLng = Number(eData.lng ?? eData.coordinates?.lng ?? eData.location?.lng);
-          if (!isNaN(eLat) && !isNaN(eLng)) {
-            const maxRadius = Number(eData.deliveryRadiusKm || eData.maxDeliveryRadiusKm || 15);
-            branches.push({
-              id: bId,
-              franchiseId: eDoc.id,
-              name: eData.name || 'Olive Pizza Franchise',
-              lat: eLat,
-              lng: eLng,
-              deliveryRadiusKm: maxRadius
-            });
-            seenBranchIds.add(bId);
-          }
-        }
-      } catch {
-        // Non-fatal
-      }
-    }
-
-    if (branches.length === 0) {
-      branches.push({
-        id: 'main_branch',
-        franchiseId: 'fra_rajnandgaon',
-        name: 'Olive Pizza (Rajnandgaon HQ)',
-        lat: 21.0974,
-        lng: 81.0347,
-        deliveryRadiusKm: 25
-      });
+      console.error('[CustomerOrderingContext] Error reading restaurant_branches from PG:', pgErr.message);
+      // Re-throw so callers fail closed on database outages rather than fabricating successful serviceability
+      throw new Error(`Database service error: unable to load canonical branches from PostgreSQL (${pgErr.message})`);
     }
 
     this.cachedBranches = branches;
@@ -227,12 +141,35 @@ export class CustomerOrderingContextService {
     branchName?: string;
     franchiseId?: string;
   }>> {
-    const branches = await this.getActiveBranchesSnapshot();
+    let branches: any[];
+    try {
+      branches = await this.getActiveBranchesSnapshot();
+    } catch {
+      return candidates.map(() => ({
+        isServiceable: false,
+        serviceabilityMessage: 'Database service error: unable to load operational branches'
+      }));
+    }
+
+    if (!branches || branches.length === 0) {
+      return candidates.map(() => ({
+        isServiceable: false,
+        serviceabilityMessage: 'No operational branches available in database'
+      }));
+    }
 
     return candidates.map((cand) => {
       const cLat = Number(cand.latitude);
       const cLng = Number(cand.longitude);
-      if (isNaN(cLat) || isNaN(cLng)) {
+      if (
+        isNaN(cLat) || 
+        isNaN(cLng) || 
+        cLat < -90 || 
+        cLat > 90 || 
+        cLng < -180 || 
+        cLng > 180 || 
+        (Math.abs(cLat) < 0.0001 && Math.abs(cLng) < 0.0001)
+      ) {
         return {
           isServiceable: false,
           serviceabilityMessage: 'Invalid coordinates'
@@ -283,7 +220,21 @@ export class CustomerOrderingContextService {
   }): Promise<OrderingContextResolutionResult> {
     const { customerId, lat, lng, addressLine, targetBranchId, targetFranchiseId } = params;
 
-    if (lat == null || lng == null || isNaN(Number(lat)) || isNaN(Number(lng))) {
+    const custLat = Number(lat);
+    const custLng = Number(lng);
+
+    // Validate coordinate ranges strictly
+    if (
+      lat == null || 
+      lng == null || 
+      isNaN(custLat) || 
+      isNaN(custLng) ||
+      custLat < -90 || 
+      custLat > 90 || 
+      custLng < -180 || 
+      custLng > 180 ||
+      (Math.abs(custLat) < 0.0001 && Math.abs(custLng) < 0.0001)
+    ) {
       return {
         isServiceable: false,
         error: 'Invalid coordinates provided for delivery location resolution.',
@@ -291,26 +242,44 @@ export class CustomerOrderingContextService {
       };
     }
 
-    const custLat = Number(lat);
-    const custLng = Number(lng);
+    // 1. Fetch active branches using snapshot cache (Fail closed on database outage)
+    let branches: any[];
+    try {
+      branches = await this.getActiveBranchesSnapshot();
+    } catch (dbErr: any) {
+      console.error('[CustomerOrderingContext] Database failure in resolveOrderingContext:', dbErr.message);
+      return {
+        isServiceable: false,
+        error: 'Branch serviceability verification unavailable due to database service error. Please try again later.',
+        code: 'SERVICE_UNAVAILABLE'
+      };
+    }
 
-    // 1. Fetch active branches using snapshot cache
-    const branches = await this.getActiveBranchesSnapshot();
+    if (!branches || branches.length === 0) {
+      return {
+        isServiceable: false,
+        error: 'No active delivery branches currently available in canonical database. Store pickup and takeaway are available.',
+        code: 'SERVICE_UNAVAILABLE'
+      };
+    }
+
     let closestBranch: any = null;
     let minDistance = Infinity;
 
-    // Prioritize target branch if explicitly requested and within serviceable radius
+    // Prioritize target branch if explicitly requested and within serviceable radius.
+    // Gracefully handle 'branch_rjn_main' / 'main_branch' aliases in application logic.
     if (targetBranchId) {
+      const isTargetRjnAlias = targetBranchId === 'main_branch' || targetBranchId === 'branch_rjn_main';
       const targetB = branches.find(b => 
         b.id === targetBranchId || 
-        ((targetBranchId === 'main_branch' || targetBranchId === 'branch_rjn_main') && (b.id === 'main_branch' || b.id === 'branch_rjn_main'))
+        (isTargetRjnAlias && (b.id === 'main_branch' || b.id === 'branch_rjn_main'))
       );
       if (targetB) {
         const dist = this.haversineDistanceKm(custLat, custLng, targetB.lat, targetB.lng);
         if (dist <= targetB.deliveryRadiusKm) {
           closestBranch = {
             ...targetB,
-            id: targetBranchId, // Preserve explicit targetBranchId requested by caller
+            id: targetBranchId, // Preserve caller's requested alias without breaking canonical routing
             maxRadius: targetB.deliveryRadiusKm
           };
           minDistance = dist;

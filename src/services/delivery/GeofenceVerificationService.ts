@@ -84,7 +84,24 @@ export class GeofenceVerificationService {
       ? Number(process.env.DELIVERY_COMPLETION_RADIUS_METERS)
       : this.DEFAULT_RADIUS_METERS;
 
-    // 1. Fetch Authoritative Rider GPS from Supabase (Single Source of Truth)
+    // 0. Verify Authenticated Assigned Rider (Must match order's canonical assigned partner)
+    const assignedRider = orderData?.deliveryPartnerId || orderData?.delivery_partner_id || orderData?.assignedRiderId;
+    if (assignedRider && assignedRider !== riderUid) {
+      return {
+        allowed: false,
+        distanceMeters: -1,
+        requiredMeters,
+        riderLat: 0,
+        riderLng: 0,
+        targetLat: 0,
+        targetLng: 0,
+        reason: `Rider ${riderUid} is not the assigned delivery partner for this canonical order. Assigned rider is ${assignedRider}.`,
+        verifiedAt
+      };
+    }
+
+    // 1. Fetch Authoritative Rider GPS strictly from Redis Telemetry (via SupabaseGpsService -> RedisGpsService)
+    // No fallback to PostgreSQL or Firestore: Redis is the single authoritative temporary GPS store.
     let riderLat: number | null = null;
     let riderLng: number | null = null;
     let accuracyMeters: number | null = null;
@@ -96,90 +113,30 @@ export class GeofenceVerificationService {
         riderLat = Number(supaLoc.latitude);
         riderLng = Number(supaLoc.longitude);
         accuracyMeters = supaLoc.accuracy != null ? Number(supaLoc.accuracy) : null;
-        locationTimestamp = supaLoc.last_updated ? new Date(supaLoc.last_updated).getTime() : 0;
+        locationTimestamp = supaLoc.updated_at ? new Date(supaLoc.updated_at).getTime() : 0;
       }
     } catch (err: any) {
-      console.warn(`[GeofenceVerificationService] Supabase GPS lookup warning for ${riderUid}:`, err?.message);
+      console.warn(`[GeofenceVerificationService] Redis GPS lookup warning for ${riderUid}:`, err?.message);
     }
 
-    // Secondary fallback: PostgreSQL delivery_partners table (Authoritative)
-    if (riderLat === null || riderLng === null) {
-      try {
-        const { query } = await import('../../lib/db.js');
-        const dpPg = await query(
-          'SELECT current_lat, current_lng, EXTRACT(EPOCH FROM last_location_time)*1000 AS ts FROM delivery_partners WHERE id = $1 OR user_id = $1 LIMIT 1',
-          [riderUid]
-        );
-        if (dpPg.rows.length > 0 && dpPg.rows[0].current_lat != null && dpPg.rows[0].current_lng != null) {
-          riderLat = Number(dpPg.rows[0].current_lat);
-          riderLng = Number(dpPg.rows[0].current_lng);
-          accuracyMeters = 10;
-          locationTimestamp = Number(dpPg.rows[0].ts) || Date.now();
-        }
-      } catch (pgErr: any) {
-        console.warn(`[GeofenceVerificationService] PostgreSQL fallback warning for ${riderUid}:`, pgErr?.message);
-      }
-    }
-
-    // Tertiary fallback: delivery_partners collection in Firestore
-    if (riderLat === null || riderLng === null) {
-      try {
-        const dpDoc = await adminDb.collection('delivery_partners').doc(riderUid).get();
-        if (dpDoc.exists) {
-          const data = dpDoc.data()!;
-          if (data.latitude != null && data.longitude != null) {
-            riderLat = Number(data.latitude);
-            riderLng = Number(data.longitude);
-            accuracyMeters = data.accuracy != null ? Number(data.accuracy) : null;
-            locationTimestamp = data.lastLocationUpdate ? new Date(data.lastLocationUpdate).getTime() : 0;
-          }
-        }
-      } catch (fsErr: any) {
-        console.warn(`[GeofenceVerificationService] Firestore fallback warning for ${riderUid}:`, fsErr?.message);
-      }
-    }
-
-    // Direct mobile client GPS payload fallback
-    if ((riderLat === null || riderLng === null) && clientProvidedCoords?.lat != null && clientProvidedCoords?.lng != null) {
-      riderLat = Number(clientProvidedCoords.lat);
-      riderLng = Number(clientProvidedCoords.lng);
-      accuracyMeters = clientProvidedCoords.accuracy ?? 10;
-      locationTimestamp = Date.now();
-    }
-
-    // Resolve Customer Target Coordinates
+    // 2. Resolve Customer Target Coordinates from canonical order record
     const target = this.resolveCustomerCoordinates(orderData);
     if (!target) {
-      // Order lacks customer coordinates (e.g. text address without pin).
-      // Accept rider coordinates as the verified delivery point if available.
-      if (riderLat !== null && riderLng !== null && !isNaN(riderLat) && !isNaN(riderLng)) {
-        return {
-          allowed: true,
-          distanceMeters: 0,
-          requiredMeters,
-          accuracyMeters: accuracyMeters ?? 10,
-          riderLat,
-          riderLng,
-          targetLat: riderLat,
-          targetLng: riderLng,
-          reason: 'Delivery completed at rider arrival coordinates (customer pin not specified on order).',
-          verifiedAt,
-        };
-      }
+      // Fail closed: Missing customer coordinates cannot complete delivery
       return {
         allowed: false,
         distanceMeters: -1,
         requiredMeters,
-        riderLat: 0,
-        riderLng: 0,
+        riderLat: riderLat ?? 0,
+        riderLng: riderLng ?? 0,
         targetLat: 0,
         targetLng: 0,
-        reason: 'Order is missing verified customer delivery coordinates, and rider GPS location was not acquired.',
+        reason: 'Order is missing verified customer delivery destination coordinates in canonical record. Delivery completion requires verified customer pin coordinates.',
         verifiedAt,
       };
     }
 
-    // 2. Strict Validation: Fail closed if rider location is unavailable
+    // 3. Strict Server-Side GPS Validation: Fail closed if trusted server rider GPS is unavailable
     if (riderLat === null || riderLng === null || isNaN(riderLat) || isNaN(riderLng)) {
       return {
         allowed: false,
@@ -189,7 +146,7 @@ export class GeofenceVerificationService {
         riderLng: 0,
         targetLat: target.lat,
         targetLng: target.lng,
-        reason: 'Unable to acquire fresh, trusted rider GPS coordinates. Please ensure location services are active.',
+        reason: 'Unable to acquire fresh, trusted server-side rider GPS coordinates. Please ensure location services are active and streaming.',
         verifiedAt,
       };
     }

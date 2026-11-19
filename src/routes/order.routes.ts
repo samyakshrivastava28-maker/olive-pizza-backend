@@ -1000,19 +1000,28 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
       }
     }
 
-    // 0. Enforce 1 active order per customer policy
+    // 0. Enforce 1 active order per customer policy (PostgreSQL is sole canonical authority)
     try {
-      // 0a. Check PostgreSQL canonical orders (Authoritative source of truth)
-      const pgActiveRes = await query(
-        `SELECT id, order_status, daily_order_no 
-         FROM canonical_orders 
-         WHERE (customer_id = $1 OR customer_id = $2) 
-           AND UPPER(order_status) NOT IN ('DELIVERED', 'CANCELLED', 'REJECTED', 'FAILED') 
-         ORDER BY created_at DESC LIMIT 1`,
-        [userId, (req.user as any)?.uid || userId]
-      );
+      let pgActiveRes: any;
+      try {
+        pgActiveRes = await query(
+          `SELECT id, order_status, daily_order_no 
+           FROM canonical_orders 
+           WHERE (customer_id = $1 OR customer_id = $2) 
+             AND UPPER(order_status) NOT IN ('DELIVERED', 'CANCELLED', 'REJECTED', 'FAILED') 
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId, (req.user as any)?.uid || userId]
+        );
+      } catch (dbErr: any) {
+        console.error('[Orders] Database error checking canonical active orders:', dbErr);
+        res.status(503).json({
+          error: 'Database service unavailable. Unable to verify active orders for checkout.',
+          code: 'DATABASE_SERVICE_UNAVAILABLE'
+        });
+        return;
+      }
 
-      if (pgActiveRes.rows.length > 0) {
+      if (pgActiveRes && pgActiveRes.rows.length > 0) {
         const activeRow = pgActiveRes.rows[0];
         const orderNum = activeRow.daily_order_no ? `#${activeRow.daily_order_no}` : `#${activeRow.id.slice(0, 6)}`;
         res.status(400).json({ 
@@ -1024,65 +1033,24 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         return;
       }
 
-      // 0b. Secondary check against Firestore projection (bounded so quota retries never stall checkout)
-      try {
-        const existingOrdersSnap = await withFirestoreTimeout(
-          adminDb.collection('orders').where('userId', '==', userId).get(),
-          'activeOrdersCheck',
-          1500
-        );
-
-        const activeOrderDoc = existingOrdersSnap.docs.find(doc => {
+      // 0b. Self-heal any stale/orphaned Firestore projections in background (never blocks checkout)
+      withFirestoreTimeout(
+        adminDb.collection('orders').where('userId', '==', userId).get(),
+        'activeOrdersCleanup',
+        1500
+      ).then(snap => {
+        snap.docs.forEach(doc => {
           const d = doc.data();
           const status = (d.status || '').toLowerCase();
-          return !['delivered', 'cancelled', 'rejected', 'failed'].includes(status);
-        });
-
-        if (activeOrderDoc) {
-          const activeData = activeOrderDoc.data();
-          // Cross-verify with PostgreSQL canonical table to ensure this order wasn't already delivered
-          let isActuallyDeliveredInPg = false;
-          try {
-            const pgCheck = await query(
-              `SELECT order_status FROM canonical_orders WHERE id = $1 LIMIT 1`,
-              [activeOrderDoc.id]
-            );
-            if (pgCheck.rows.length > 0) {
-              const pgStatus = (pgCheck.rows[0].order_status || '').toUpperCase();
-              if (pgStatus === 'DELIVERED' || pgStatus === 'CANCELLED') {
-                isActuallyDeliveredInPg = true;
-                // Clean up Firestore doc state
-                await adminDb.collection('orders').doc(activeOrderDoc.id).update({
-                  status: pgStatus.toLowerCase(),
-                  order_status: pgStatus,
-                  live_lifecycle: 'TERMINAL'
-                }).catch(() => {});
-              }
-            } else {
-              // Orphaned Firestore projection without PostgreSQL canonical backing: self-heal and allow checkout
-              isActuallyDeliveredInPg = true;
-              await adminDb.collection('orders').doc(activeOrderDoc.id).update({
-                status: 'delivered',
-                order_status: 'DELIVERED',
-                live_lifecycle: 'TERMINAL'
-              }).catch(() => {});
-            }
-          } catch {}
-
-          if (!isActuallyDeliveredInPg) {
-            const orderNum = activeData.dailyOrderNumber ? `#${activeData.dailyOrderNumber}` : `#${activeOrderDoc.id.slice(0, 6)}`;
-            res.status(400).json({ 
-              error: `You already have an active order in progress (${orderNum}). Please wait until your current order is delivered before placing another order.`,
-              code: 'ACTIVE_ORDER_EXISTS',
-              activeOrderId: activeOrderDoc.id,
-              activeOrderStatus: activeData.status
-            });
-            return;
+          if (!['delivered', 'cancelled', 'rejected', 'failed'].includes(status)) {
+            adminDb.collection('orders').doc(doc.id).update({
+              status: 'delivered',
+              order_status: 'DELIVERED',
+              live_lifecycle: 'TERMINAL'
+            }).catch(() => {});
           }
-        }
-      } catch (firestoreErr: any) {
-        console.warn('[Orders] Firestore active order check notice (quota/network):', firestoreErr?.message);
-      }
+        });
+      }).catch(() => {});
     } catch (activeOrderErr: any) {
       console.warn('[Orders] Active order check notice:', activeOrderErr.message);
     }

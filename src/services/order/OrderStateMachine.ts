@@ -55,7 +55,7 @@ export interface TransitionResult {
 const ALLOWED_TRANSITIONS: Record<CanonicalOrderStatus, CanonicalOrderStatus[]> = {
   pending:          ['accepted', 'preparing', 'cancelled'],
   accepted:         ['preparing', 'ready', 'cancelled'],
-  preparing:        ['partner_assigned', 'ready', 'picked_up', 'delivered', 'cancelled'],
+  preparing:        ['partner_assigned', 'ready', 'cancelled'],
   partner_assigned: ['ready', 'picked_up', 'out_for_delivery', 'delivered', 'cancelled'],
   ready:            ['partner_assigned', 'picked_up', 'out_for_delivery', 'delivered', 'cancelled'],
   picked_up:        ['out_for_delivery', 'delivered', 'delivery_failed'],
@@ -138,61 +138,67 @@ export class OrderStateMachine {
 
 
     let client = await pgPool.connect().catch(() => null);
+    if (!client) {
+      return {
+        success: false,
+        orderId,
+        previousStatus: 'pending',
+        currentStatus: 'pending',
+        version: 0,
+        error: 'Database service unavailable (503). PostgreSQL connection is required for canonical order status transitions.'
+      };
+    }
     
     try {
-      if (client) {
-        await client.query('BEGIN').catch(() => {});
-        await client.query(
-          `INSERT INTO order_locks (order_id) VALUES ($1) ON CONFLICT (order_id) DO UPDATE SET locked_at = NOW()`,
-          [orderId]
-        ).catch(() => {});
-      }
+      await client.query('BEGIN').catch(() => {});
+      await client.query(
+        `INSERT INTO order_locks (order_id) VALUES ($1) ON CONFLICT (order_id) DO UPDATE SET locked_at = NOW()`,
+        [orderId]
+      ).catch(() => {});
 
       // Rule BR-05: PostgreSQL is the sole authoritative source of truth for order statuses
       let orderData: any = null;
-      if (client) {
-        try {
-          const pgRes = await client.query(
-            `SELECT * FROM canonical_orders WHERE id = $1 LIMIT 1`,
-            [orderId]
-          );
-          if (pgRes.rows.length > 0) {
-            const row = pgRes.rows[0];
-            orderData = {
-              id: row.id,
-              status: (row.order_status || 'PENDING').toLowerCase(),
-              order_status: row.order_status,
-              branchId: row.branch_id,
-              franchiseId: row.franchise_id,
-              deliveryPartnerId: row.delivery_partner_id,
-              deliveryPartnerName: row.delivery_partner_name,
-              deliveryPartnerPhone: row.delivery_partner_phone,
-              customerName: row.customer_name,
-              customerPhone: row.customer_phone,
-              contactPhone: row.customer_phone,
-              totalAmount: Number(row.total_amount || 0),
-              paymentMethod: row.payment_method,
-              paymentStatus: row.payment_status,
-              orderType: row.order_type,
-              fulfillmentType: row.order_type,
-              deliveryType: row.order_type,
-              deliveryAddress: typeof row.delivery_address === 'string' && row.delivery_address.startsWith('{')
-                ? JSON.parse(row.delivery_address)
-                : (typeof row.delivery_address === 'object' && row.delivery_address !== null ? row.delivery_address : { addressLine: row.delivery_address }),
-              location: (row.metadata && row.metadata.location) || null,
-              customerLocation: (row.metadata && (row.metadata.customerLocation || row.metadata.location)) || null,
-              deliveryLocation: (row.metadata && (row.metadata.deliveryLocation || row.metadata.location)) || null,
-              isPaid: row.payment_status === 'PAID' || row.payment_status === 'COLLECTED',
-              expectedReadyAt: row.expected_ready_at,
-              estimatedPreparationMinutes: row.estimated_preparation_minutes,
-              dailyOrderNumber: row.daily_order_no,
-              permanentBillNo: row.permanent_bill_no,
-              notification_version: Number(row.version || 1)
-            };
-          }
-        } catch (pgErr: any) {
-          console.warn(`[OrderStateMachine] PostgreSQL direct canonical read notice for ${orderId}:`, pgErr.message);
+      try {
+        const pgRes = await client.query(
+          `SELECT * FROM canonical_orders WHERE id = $1 LIMIT 1`,
+          [orderId]
+        );
+        if (pgRes.rows.length > 0) {
+          const row = pgRes.rows[0];
+          orderData = {
+            id: row.id,
+            status: (row.order_status || 'PENDING').toLowerCase(),
+            order_status: row.order_status,
+            branchId: row.branch_id,
+            franchiseId: row.franchise_id,
+            deliveryPartnerId: row.delivery_partner_id,
+            deliveryPartnerName: row.delivery_partner_name,
+            deliveryPartnerPhone: row.delivery_partner_phone,
+            customerName: row.customer_name,
+            customerPhone: row.customer_phone,
+            contactPhone: row.customer_phone,
+            totalAmount: Number(row.total_amount || 0),
+            paymentMethod: row.payment_method,
+            paymentStatus: row.payment_status,
+            orderType: row.order_type,
+            fulfillmentType: row.order_type,
+            deliveryType: row.order_type,
+            deliveryAddress: typeof row.delivery_address === 'string' && row.delivery_address.startsWith('{')
+              ? JSON.parse(row.delivery_address)
+              : (typeof row.delivery_address === 'object' && row.delivery_address !== null ? row.delivery_address : { addressLine: row.delivery_address }),
+            location: (row.metadata && row.metadata.location) || null,
+            customerLocation: (row.metadata && (row.metadata.customerLocation || row.metadata.location)) || null,
+            deliveryLocation: (row.metadata && (row.metadata.deliveryLocation || row.metadata.location)) || null,
+            isPaid: row.payment_status === 'PAID' || row.payment_status === 'COLLECTED',
+            expectedReadyAt: row.expected_ready_at,
+            estimatedPreparationMinutes: row.estimated_preparation_minutes,
+            dailyOrderNumber: row.daily_order_no,
+            permanentBillNo: row.permanent_bill_no,
+            notification_version: Number(row.version || 1)
+          };
         }
+      } catch (pgErr: any) {
+        console.warn(`[OrderStateMachine] PostgreSQL direct canonical read notice for ${orderId}:`, pgErr.message);
       }
 
       if (!orderData) {
@@ -205,26 +211,22 @@ export class OrderStateMachine {
       }
 
       const orderRef = adminDb.collection('orders').doc(orderId);
-      if (!orderData) {
-        try {
-          const docSnap = await withTimeout(orderRef.get(), 'stateMachineOrderRead', 1500);
-          if (docSnap && docSnap.exists) {
-            orderData = docSnap.data()!;
-          }
-        } catch (fsErr: any) {
-          console.warn(`[OrderStateMachine] Firestore read notice for ${orderId}:`, fsErr.message);
-        }
-      }
 
+      // Fail closed: PostgreSQL is the sole authority for order existence. Zero Firestore fallback.
       if (!orderData) {
-        if (client) await client.query('ROLLBACK').catch(() => {});
+        if (client) {
+          await client.query('ROLLBACK').catch(() => {});
+          await client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
+          client.release();
+          client = null;
+        }
         return {
           success: false,
           orderId,
           previousStatus: 'pending',
           currentStatus: 'pending',
           version: 0,
-          error: 'Order not found',
+          error: 'Canonical order not found in PostgreSQL database',
         };
       }
 
@@ -795,14 +797,43 @@ export class OrderStateMachine {
           console.warn('[OrderStateMachine] Outbox event record notice:', outboxErr.message);
         }
 
-        await client.query('COMMIT').catch(() => {});
-        await client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
-        client.release();
-        client = null;
+        let commitSuccess = false;
+        try {
+          await client.query('COMMIT');
+          commitSuccess = true;
+        } catch (commitErr: any) {
+          console.error(`[OrderStateMachine] PostgreSQL transaction COMMIT failed for ${orderId}:`, commitErr?.message);
+          await client.query('ROLLBACK').catch(() => {});
+        } finally {
+          await client.query('DELETE FROM order_locks WHERE order_id = $1', [orderId]).catch(() => {});
+          client.release();
+          client = null;
+        }
+
+        if (!commitSuccess) {
+          return {
+            success: false,
+            orderId,
+            previousStatus: fromState,
+            currentStatus: fromState,
+            version: 0,
+            error: 'Failed to commit order status transition to canonical PostgreSQL database (503).'
+          };
+        }
+      } else {
+        // Zero write authority fallback to Firestore: If client is null, mutations cannot proceed.
+        return {
+          success: false,
+          orderId,
+          previousStatus: fromState,
+          currentStatus: fromState,
+          version: 0,
+          error: 'PostgreSQL connection unavailable. Status transitions cannot succeed without canonical database commit (503).'
+        };
       }
 
       // ASYNCHRONOUS EXTERNAL WAN & DOWNSTREAM PROJECTIONS
-      // Executed strictly AFTER PostgreSQL transaction commit and client release to avoid WAN-induced latency / DB pool starvation
+      // Executed strictly AFTER successful PostgreSQL transaction commit and client release
       orderRef.set(updates, { merge: true }).catch((fsWriteErr: any) => {
         console.warn(`[OrderStateMachine] Firestore write notice for ${orderId}:`, fsWriteErr.message);
       });

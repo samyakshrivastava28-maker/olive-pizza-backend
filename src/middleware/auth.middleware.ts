@@ -160,6 +160,15 @@ export const verifyToken = async (req: AuthRequest, res: Response, next: NextFun
         if (pgUser.role && pgUser.role !== 'customer') {
           role = pgUser.role;
         }
+        if (pgUser.metadata) {
+          let meta: any = pgUser.metadata;
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch {}
+          }
+          if (meta && typeof meta === 'object') {
+            terminalId = meta.terminalId || meta.terminal_id;
+          }
+        }
         dbResolved = true;
 
         if (pgUser.franchise_id) franchiseId = pgUser.franchise_id;
@@ -176,7 +185,7 @@ export const verifyToken = async (req: AuthRequest, res: Response, next: NextFun
       return;
     }
 
-        // Check delivery_partners in database if not already resolved as staff or owner
+    // Check delivery_partners in database if not already resolved as staff or owner
     if (!dbResolved || role === 'customer') {
       try {
         const dpRes = await query(
@@ -212,185 +221,59 @@ export const verifyToken = async (req: AuthRequest, res: Response, next: NextFun
       }
     }
 
-    // Fallback to Firestore only if not found in PostgreSQL database
+    // Authoritative check: Fail closed if not resolved in PostgreSQL database. Zero Firestore fallback.
     if (!dbResolved) {
+      // Customer registration exception: controlled insert-only registration for customers in app_users
       try {
-        let userData: any = null;
-        const userDoc = await adminDb.collection('users').doc(uid).get().catch(() => null);
-        if (userDoc && userDoc.exists) {
-          userData = userDoc.data()!;
-        } else if (emailLower) {
-          const q = await adminDb.collection('users').where('email', '==', emailLower).limit(1).get().catch(() => ({ empty: true, docs: [] } as any));
-          if (!q.empty) {
-            userData = q.docs[0].data();
-          }
-        }
+        await query(
+          `INSERT INTO app_users (
+             id, email, phone, name, role, status, is_active, allowed_apps, created_at, updated_at
+           ) VALUES (
+             $1, $2, $3, $4, 'customer', 'APPROVED', true, '["CUSTOMER"]'::jsonb, NOW(), NOW()
+           )
+           ON CONFLICT (id) DO NOTHING`,
+          [uid, emailLower || null, phoneRaw || null, emailLower ? emailLower.split('@')[0] : 'Customer']
+        );
 
-        if (userData) {
-          if (userData.isActive === false || userData.status === 'REVOKED' || userData.role === 'REVOKED' || userData.status === 'suspended') {
-            res.status(403).json({ error: 'Forbidden: Account has been deactivated or revoked', code: 'ACCOUNT_REVOKED' });
+        const newCustLookup = await query(
+          `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, metadata
+           FROM app_users
+           WHERE id = $1
+           LIMIT 1`,
+          [uid]
+        );
+
+        if (newCustLookup.rows.length > 0) {
+          const u = newCustLookup.rows[0];
+          if (u.is_active === false || ['REVOKED', 'SUSPENDED', 'DISABLED', 'REJECTED'].includes(u.status)) {
+            res.status(403).json({ error: 'Forbidden: Account has been deactivated or revoked in system database', code: 'ACCOUNT_REVOKED' });
             return;
           }
-
-          const isOwnerMode = userData.isOwnerMode === true || 
-                              userData.isGlobalOwner === true || 
-                              userData.admin === true || 
-                              (userData.role || '').toLowerCase() === 'owner' || 
-                              (userData.role || '').toLowerCase() === 'platform_owner';
-
-          if (isOwnerMode) {
-            role = 'owner';
-            allowedApps = Array.from(new Set(['OWNER', 'CUSTOMER', ...allowedApps]));
-            permissions = ['*'];
-            dbResolved = true;
-          } else if (userData.role && userData.role !== 'customer') {
-            role = userData.role;
-            dbResolved = true;
-          }
-
-          if (Array.isArray(userData.allowedApps)) {
-            allowedApps = Array.from(new Set([...allowedApps, ...userData.allowedApps]));
-          }
-          if (userData.applicationAccess) {
-            if (userData.applicationAccess.app_pos) allowedApps.push('POS');
-            if (userData.applicationAccess.app_restaurant_management) allowedApps.push('RESTAURANT_MANAGER');
-            if (userData.applicationAccess.app_franchise_management) allowedApps.push('FRANCHISE_MANAGER');
-            if (userData.applicationAccess.app_delivery) allowedApps.push('DELIVERY');
-            allowedApps = Array.from(new Set(allowedApps));
-          }
-
-          if (userData.organizationId) organizationId = userData.organizationId;
-          if (userData.franchiseId) franchiseId = userData.franchiseId;
-          if (userData.branchId) branchId = userData.branchId;
-          if (userData.branchIds && Array.isArray(userData.branchIds)) branchIds = userData.branchIds;
-          if (userData.permissions && permissions.length === 0) permissions = userData.permissions;
-          if (userData.allowedApps && Array.isArray(userData.allowedApps)) {
-            allowedApps = Array.from(new Set([...allowedApps, ...userData.allowedApps]));
-          }
-          if (userData.isActive !== undefined) isActive = userData.isActive;
-          // POS terminal binding — stored in Firestore user record for cashier role
-          if (userData.terminalId) terminalId = userData.terminalId as string;
+          role = u.role || 'customer';
+          allowedApps = Array.isArray(u.allowed_apps) ? [...u.allowed_apps] : ['CUSTOMER'];
+          if (u.franchise_id) franchiseId = u.franchise_id;
+          if (u.branch_id) branchId = u.branch_id;
+          branchIds = branchId ? [branchId] : branchIds;
+          isActive = u.is_active !== false;
+          dbResolved = true;
         }
-      } catch (fsErr: any) {
-        console.warn('[verifyToken] Firestore read fallback notice:', fsErr.message);
+      } catch (custErr: any) {
+        console.error('[verifyToken] Customer auto-registration failure (PostgreSQL error):', custErr.message);
+        res.status(503).json({
+          error: 'Service temporarily unavailable: Unable to verify authorization against authoritative database',
+          code: 'AUTH_DATABASE_UNAVAILABLE'
+        });
+        return;
       }
     }
 
-    // Secondary fallback: if user role is still 'customer' and not resolved in DB, check role-specific operational collections
-    if (!dbResolved && (role === 'customer' || !role)) {
-      try {
-        const emailLower = decodedToken.email ? decodedToken.email.toLowerCase().trim() : '';
-
-          // Check restaurant_managers by UID and Email fallback
-          let rmData: any = null;
-          const rmDoc = await adminDb.collection('restaurant_managers').doc(uid).get().catch(() => null);
-          if (rmDoc && rmDoc.exists) {
-            rmData = rmDoc.data();
-          } else if (emailLower) {
-            const rmSnap = await adminDb.collection('restaurant_managers').where('email', '==', emailLower).limit(1).get().catch(() => ({ empty: true, docs: [] } as any));
-            if (!rmSnap.empty) {
-              rmData = rmSnap.docs[0].data();
-            }
-          }
-
-          if (rmData) {
-            if (rmData.isActive === false || rmData.status === 'REVOKED' || rmData.status === 'TERMINATED') {
-              res.status(403).json({ error: 'Forbidden: Restaurant manager account has been revoked', code: 'ACCOUNT_REVOKED' });
-              return;
-            }
-            if (rmData.status === 'APPROVED' || rmData.isActive === true) {
-              role = rmData.role || 'restaurant_manager';
-              if (rmData.branchId) branchId = rmData.branchId;
-              if (rmData.franchiseId) franchiseId = rmData.franchiseId;
-              if (rmData.permissions) permissions = rmData.permissions;
-              allowedApps = Array.from(new Set([...allowedApps, 'RESTAURANT_MANAGER']));
-            }
-          }
-
-          // Check delivery_partners by UID and Email fallback
-          if (role === 'customer' || !role) {
-            let dpData: any = null;
-            const dpDoc = await adminDb.collection('delivery_partners').doc(uid).get().catch(() => null);
-            if (dpDoc && dpDoc.exists) {
-              dpData = dpDoc.data();
-            } else if (emailLower) {
-              const dpSnap = await adminDb.collection('delivery_partners').where('email', '==', emailLower).limit(1).get().catch(() => ({ empty: true, docs: [] } as any));
-              if (!dpSnap.empty) {
-                dpData = dpSnap.docs[0].data();
-              }
-            }
-
-            if (dpData) {
-              if (dpData.isActive === false || dpData.status === 'REVOKED' || dpData.status === 'INACTIVE' || dpData.status === 'BLOCKED') {
-                res.status(403).json({ error: 'Forbidden: Delivery partner account has been revoked or deactivated', code: 'ACCOUNT_REVOKED' });
-                return;
-              }
-              if (dpData.status === 'approved' || dpData.status === 'APPROVED' || dpData.isActive === true) {
-                role = dpData.role || 'delivery_partner';
-                if (dpData.branchId) branchId = dpData.branchId;
-                if (dpData.franchiseId) franchiseId = dpData.franchiseId;
-                allowedApps = Array.from(new Set([...allowedApps, 'DELIVERY']));
-              }
-            }
-          }
-
-          // Check franchise_users by UID and Email fallback
-          if (role === 'customer' || !role) {
-            let fuData: any = null;
-            const fuDoc = await adminDb.collection('franchise_users').doc(uid).get().catch(() => null);
-            if (fuDoc && fuDoc.exists) {
-              fuData = fuDoc.data();
-            } else if (emailLower) {
-              const fuSnap = await adminDb.collection('franchise_users').where('email', '==', emailLower).limit(1).get().catch(() => ({ empty: true, docs: [] } as any));
-              if (!fuSnap.empty) {
-                fuData = fuSnap.docs[0].data();
-              }
-            }
-
-            if (fuData) {
-              if (fuData.isActive === false || fuData.status === 'REVOKED' || fuData.status === 'SUSPENDED') {
-                res.status(403).json({ error: 'Forbidden: Franchise manager account has been revoked', code: 'ACCOUNT_REVOKED' });
-                return;
-              }
-              if (fuData.status === 'APPROVED' || fuData.isActive === true) {
-                role = fuData.role || 'franchise_manager';
-                if (fuData.franchiseId) franchiseId = fuData.franchiseId;
-                if (fuData.branchIds) branchIds = fuData.branchIds;
-                allowedApps = Array.from(new Set([...allowedApps, 'FRANCHISE_MANAGER']));
-              }
-            }
-          }
-
-          // Check pos_accounts by UID and Email fallback
-          if (role === 'customer' || !role) {
-            let posData: any = null;
-            const posDoc = await adminDb.collection('pos_accounts').doc(uid).get().catch(() => null);
-            if (posDoc && posDoc.exists) {
-              posData = posDoc.data();
-            } else if (emailLower) {
-              const posSnap = await adminDb.collection('pos_accounts').where('email', '==', emailLower).limit(1).get().catch(() => ({ empty: true, docs: [] } as any));
-              if (!posSnap.empty) {
-                posData = posSnap.docs[0].data();
-              }
-            }
-
-            if (posData) {
-              if (posData.isActive === false || posData.status === 'REVOKED' || posData.status === 'DEACTIVATED' || posData.status === 'REJECTED') {
-                res.status(403).json({ error: 'Forbidden: POS terminal account has been revoked', code: 'ACCOUNT_REVOKED' });
-                return;
-              }
-              if (posData.status === 'APPROVED' || posData.status === 'ACTIVE' || posData.isActive === true) {
-                role = posData.role || 'pos_operator';
-                if (posData.franchiseId) franchiseId = posData.franchiseId;
-                if (posData.branchId) branchId = posData.branchId;
-                if (posData.terminalId) terminalId = posData.terminalId;
-                allowedApps = Array.from(new Set([...allowedApps, 'POS']));
-              }
-            }
-          }
-      } catch (dbErr) {
-        console.warn('[AuthMiddleware] Failed to read fallback role from Firestore:', dbErr);
-      }
+    // Fail closed: Missing or unresolved account in PostgreSQL
+    if (!dbResolved) {
+      res.status(403).json({
+        error: 'Forbidden: Account is not registered in the authoritative system database',
+        code: 'NOT_REGISTERED'
+      });
+      return;
     }
 
     const scope = FranchiseScopeService.resolveScope({

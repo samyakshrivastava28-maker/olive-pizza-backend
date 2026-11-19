@@ -199,11 +199,14 @@ export class FranchiseAccessService {
     const allowedAppsJson = JSON.stringify(allowedApps);
     const existingMeta = (pgExisting?.metadata && typeof pgExisting.metadata === 'object') ? { ...pgExisting.metadata } : {};
     if (accessEntry.applications.pos && accountStatus === 'ACTIVE') {
+      const docTerm = userDocSnap.exists ? userDocSnap.data()?.terminalId : null;
       const termList = Array.isArray(existingMeta.allowed_terminals) && existingMeta.allowed_terminals.length > 0
         ? existingMeta.allowed_terminals
-        : [ (userDocSnap.exists ? userDocSnap.data()?.terminalId : null) || 'POS-01' ];
-      existingMeta.allowed_terminals = termList;
-      existingMeta.terminalId = termList[0];
+        : (docTerm ? [docTerm] : []);
+      if (termList.length > 0) {
+        existingMeta.allowed_terminals = termList;
+        existingMeta.terminalId = termList[0];
+      }
     }
 
     await query(
@@ -319,7 +322,10 @@ export class FranchiseAccessService {
       userUpdates.branchId = effectiveBranchId;
       userUpdates.franchiseId = franchiseId;
       if (accessEntry.applications.pos) {
-        userUpdates.terminalId = (userDocSnap.exists ? userDocSnap.data()?.terminalId : null) || 'POS-01';
+        const docTerm = userDocSnap.exists ? userDocSnap.data()?.terminalId : null;
+        if (docTerm) {
+          userUpdates.terminalId = docTerm;
+        }
       }
     } else {
       userUpdates.status = accountStatus;
@@ -545,6 +551,37 @@ export class FranchiseAccessService {
                 reason: 'Failed to provision customer profile in authoritative database'
               };
             }
+          } else if (targetApp === 'DELIVERY') {
+            // Authoritative check against PostgreSQL delivery_partners fleet table
+            const riderRes = await query(
+              `SELECT id, name, phone, email, status, is_online, branch_id, franchise_id, vehicle_type, vehicle_number
+               FROM delivery_partners
+               WHERE id = $1 OR user_id = $1 OR (email IS NOT NULL AND email <> '' AND LOWER(email) = LOWER($2))
+               LIMIT 1`,
+              [uid, emailLower]
+            );
+            if (riderRes.rows.length > 0) {
+              const r = riderRes.rows[0];
+              pgUserData = {
+                id: r.id,
+                email: r.email,
+                phone: r.phone,
+                name: r.name,
+                role: 'delivery_partner',
+                status: r.status,
+                is_active: r.status === 'APPROVED' || r.status === 'ACTIVE',
+                franchise_id: r.franchise_id,
+                branch_id: r.branch_id,
+                allowed_apps: ['DELIVERY'],
+                metadata: {}
+              };
+            } else {
+              return {
+                authorized: false,
+                code: 'NOT_REGISTERED',
+                reason: `Account is not registered for DELIVERY in the authoritative system database.`
+              };
+            }
           } else {
             // Management apps: Strict fail-closed. Unregistered accounts cannot access staff portals.
             return {
@@ -724,28 +761,43 @@ export class FranchiseAccessService {
       };
     }
 
-    // D. POS Terminal Authoritative Validation and Derivation
+    // D. POS Terminal Authoritative Validation and Derivation (Fail-closed: No fallback to POS-01)
     let resolvedTerminal = (terminalId || pgUserData.terminal_id || metadataObj.terminalId || metadataObj.terminal_id || '').trim();
     if (targetApp === 'POS') {
-      if (isOwnerAccount) {
-        resolvedTerminal = resolvedTerminal || 'POS-01';
-      } else {
-        const allowedTerminals: string[] = metadataObj.allowed_terminals || metadataObj.allowedTerminals || [];
+      const explicitAssignedTerminal = (pgUserData.terminal_id || metadataObj.terminalId || metadataObj.terminal_id || '').trim();
+      const allowedTerminals: string[] = Array.isArray(metadataObj.allowed_terminals) 
+        ? metadataObj.allowed_terminals 
+        : (Array.isArray(metadataObj.allowedTerminals) 
+            ? metadataObj.allowedTerminals 
+            : (explicitAssignedTerminal ? [explicitAssignedTerminal] : []));
 
-        // 1. Zero Allowed Terminals in Database -> Fallback to POS-01 for active staff
-        if (!Array.isArray(allowedTerminals) || allowedTerminals.length === 0) {
-          resolvedTerminal = resolvedTerminal || 'POS-01';
-        } else if (resolvedTerminal) {
-          if (!allowedTerminals.includes(resolvedTerminal)) {
-            return {
-              authorized: false,
-              code: 'TERMINAL_NOT_PERMITTED',
-              reason: `Terminal "${resolvedTerminal}" is not permitted for this operator. Allowed terminals: ${allowedTerminals.join(', ')}.`
-            };
-          }
-        } else {
-          resolvedTerminal = allowedTerminals[0] || 'POS-01';
+      // Missing or empty allowed terminals in PostgreSQL fails closed
+      if (allowedTerminals.length === 0 && !explicitAssignedTerminal) {
+        return {
+          authorized: false,
+          code: 'TERMINAL_NOT_PERMITTED',
+          reason: 'No POS terminals are permitted for this operator account in PostgreSQL. Explicit terminal grant is required.'
+        };
+      }
+
+      if (resolvedTerminal) {
+        if (allowedTerminals.length > 0 && !allowedTerminals.includes(resolvedTerminal) && explicitAssignedTerminal !== resolvedTerminal) {
+          return {
+            authorized: false,
+            code: 'TERMINAL_NOT_PERMITTED',
+            reason: `Terminal "${resolvedTerminal}" is not permitted for this operator. Allowed terminals: ${allowedTerminals.join(', ')}.`
+          };
         }
+      } else if (allowedTerminals.length > 0) {
+        resolvedTerminal = allowedTerminals[0];
+      } else if (explicitAssignedTerminal) {
+        resolvedTerminal = explicitAssignedTerminal;
+      } else {
+        return {
+          authorized: false,
+          code: 'TERMINAL_NOT_PERMITTED',
+          reason: 'No permitted POS terminal could be resolved for this operator. Explicit terminal grant is required.'
+        };
       }
     }
 

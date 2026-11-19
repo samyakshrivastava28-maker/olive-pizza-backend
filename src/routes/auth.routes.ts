@@ -631,7 +631,7 @@ router.post('/management/check-eligibility', async (req: Request, res: Response)
 
     let resolvedUser: any = null;
 
-    // 2. Query PostgreSQL app_users
+    // 2. Query PostgreSQL app_users (Canonical source of truth)
     try {
       const pgRes = await query(
         `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active
@@ -645,58 +645,18 @@ router.post('/management/check-eligibility', async (req: Request, res: Response)
         resolvedUser = pgRes.rows[0];
       }
     } catch (pgErr) {
-      console.warn('[ManagementAuth] PostgreSQL query notice:', pgErr);
+      console.error('[ManagementAuth] PostgreSQL query failure in check-eligibility:', pgErr);
+      res.status(503).json({
+        success: false,
+        eligible: false,
+        message: 'Database service unavailable. Please try again later.'
+      });
+      return;
     }
 
-    // 3. Fallback to Firestore users if not found in PostgreSQL
-    if (!resolvedUser && adminDb) {
-      try {
-        if (emailLower) {
-          const userSnap = await adminDb.collection('users').where('email', '==', emailLower).limit(1).get();
-          if (!userSnap.empty) {
-            resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
-          }
-        }
-        if (!resolvedUser && phoneClean) {
-          const userSnap = await adminDb.collection('users').where('phone', '==', phoneClean).limit(1).get();
-          if (!userSnap.empty) {
-            resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
-          }
-        }
-      } catch (fsErr) {
-        console.warn('[ManagementAuth] Firestore query notice:', fsErr);
-      }
-    }
-
-    // 4. If targetApp is DELIVERY, also check delivery_partners collection
-    if (!resolvedUser && appKey === 'DELIVERY' && adminDb) {
-      try {
-        if (emailLower) {
-          const riderSnap = await adminDb.collection('delivery_partners').where('email', '==', emailLower).limit(1).get();
-          if (!riderSnap.empty) {
-            resolvedUser = { ...riderSnap.docs[0].data(), id: riderSnap.docs[0].id, role: 'delivery_partner' };
-          }
-        }
-      } catch (rErr) {
-        console.warn('[ManagementAuth] delivery_partners check notice:', rErr);
-      }
-    }
-
-    // Special authorization rule for Owner / SuperAdmin
-    if (isOwnerEmail && !resolvedUser) {
-      resolvedUser = {
-        id: emailLower === 'webhub2811@gmail.com' ? '6tLLR6q7aTYqzTG2blRx3TU5sA42' : 'usr_owner_olive',
-        email: emailLower,
-        name: 'Olive Pizza Owner',
-        role: 'owner',
-        is_active: true,
-        franchise_id: 'fra_rajnandgaon',
-        branch_id: 'branch_rjn_main'
-      };
-    }
-
+    // Fail closed: No Firestore fallback and no synthetic owner object
     if (!resolvedUser) {
-      res.status(200).json({
+      res.status(403).json({
         success: false,
         eligible: false,
         message: 'No registered Olive Pizza management account found with this credential. Please contact Administration.'
@@ -706,7 +666,7 @@ router.post('/management/check-eligibility', async (req: Request, res: Response)
 
     // Check account active state
     if (resolvedUser.is_active === false || resolvedUser.status === 'SUSPENDED' || resolvedUser.status === 'DEACTIVATED') {
-      res.status(200).json({
+      res.status(403).json({
         success: false,
         eligible: false,
         message: 'This management account has been deactivated. Please contact Olive Pizza Administration.'
@@ -715,33 +675,32 @@ router.post('/management/check-eligibility', async (req: Request, res: Response)
     }
 
     const userRole = (resolvedUser.role || '').toLowerCase();
-    const isOwner = isOwnerEmail || userRole === 'owner' || userRole === 'admin' || userRole === 'developer';
-    const allowedApps = resolvedUser.allowed_apps || [];
+    const isOwner = (isOwnerEmail || userRole === 'owner') && resolvedUser.is_active !== false;
 
-    // Verify app-specific eligibility
-    let isAppAuthorized = false;
-    if (isOwner) {
-      isAppAuthorized = true; // Owners have full unrestricted access to ALL 5 apps
-    } else {
-      switch (appKey) {
-        case 'RESTAURANT_MANAGER':
-          isAppAuthorized = ['restaurant_manager', 'manager', 'kitchen', 'owner', 'admin'].includes(userRole) || allowedApps.includes('RESTAURANT_MANAGER');
-          break;
-        case 'FRANCHISE_MANAGER':
-          isAppAuthorized = ['franchise_manager', 'franchise', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('FRANCHISE_MANAGER');
-          break;
-        case 'POS':
-          isAppAuthorized = ['cashier', 'pos', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('POS');
-          break;
-        case 'DELIVERY':
-          isAppAuthorized = ['delivery_partner', 'rider', 'owner', 'admin'].includes(userRole) || allowedApps.includes('DELIVERY');
-          break;
-        case 'OWNER':
-          isAppAuthorized = isOwner;
-          break;
-        default:
-          isAppAuthorized = false;
+    // Parse PostgreSQL allowed_apps strictly
+    let allowedApps: string[] = [];
+    if (Array.isArray(resolvedUser.allowed_apps)) {
+      allowedApps = resolvedUser.allowed_apps.map((a: any) => String(a).toUpperCase());
+    } else if (typeof resolvedUser.allowed_apps === 'string') {
+      try {
+        const parsed = JSON.parse(resolvedUser.allowed_apps);
+        if (Array.isArray(parsed)) {
+          allowedApps = parsed.map((a: any) => String(a).toUpperCase());
+        } else {
+          allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
+        }
+      } catch {
+        allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
       }
+    }
+
+    // Verify app-specific eligibility:
+    // Owner receives OWNER access by default only. Other apps require explicit active grants in allowed_apps.
+    let isAppAuthorized = false;
+    if (appKey === 'OWNER') {
+      isAppAuthorized = isOwner || allowedApps.includes('OWNER');
+    } else {
+      isAppAuthorized = allowedApps.includes(appKey);
     }
 
     if (!isAppAuthorized) {
@@ -752,10 +711,10 @@ router.post('/management/check-eligibility', async (req: Request, res: Response)
         DELIVERY: 'Delivery Raider',
         OWNER: 'Owner Portal'
       };
-      res.status(200).json({
+      res.status(403).json({
         success: false,
         eligible: false,
-        message: `Your account (${resolvedUser.email || identifier}) is verified, but not authorized for ${appNames[appKey] || appKey}. Please contact Olive Pizza Administration.`
+        message: `Your account (${resolvedUser.email || identifier}) is verified, but not authorized for ${appNames[appKey] || appKey}. Explicit active grant in PostgreSQL allowed_apps is required.`
       });
       return;
     }
@@ -828,13 +787,13 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
       return;
     }
 
-    // 2. Resolve user record
+    // 2. Resolve user record authoritatively from PostgreSQL app_users
     const isOwnerEmail = cleanEmail === 'webhub2811@gmail.com' || cleanEmail === 'olivepizzarjn@gmail.com';
     let resolvedUser: any = null;
 
     try {
       const pgRes = await query(
-        `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active
+        `SELECT id, email, phone, name, role, status, franchise_id, branch_id, allowed_apps, is_active, firebase_uid
          FROM app_users
          WHERE LOWER(email) = LOWER($1)
          LIMIT 1`,
@@ -843,22 +802,56 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
       if (pgRes.rows.length > 0) {
         resolvedUser = pgRes.rows[0];
       }
-    } catch (e) {}
+    } catch (e: any) {
+      console.error('[ManagementAuth] PostgreSQL query error in verify-code-signin:', e);
+      res.status(503).json({ success: false, message: 'Database service unavailable. Please try again later.' });
+      return;
+    }
 
-    if (!resolvedUser && adminDb) {
-      const userSnap = await adminDb.collection('users').where('email', '==', cleanEmail).limit(1).get().catch(() => null);
-      if (userSnap && !userSnap.empty) {
-        resolvedUser = { ...userSnap.docs[0].data(), id: userSnap.docs[0].id };
+    // Fail closed: No Firestore fallback and no synthetic identity creation
+    if (!resolvedUser) {
+      res.status(403).json({ success: false, message: 'No registered Olive Pizza management account found in PostgreSQL.' });
+      return;
+    }
+
+    if (resolvedUser.is_active === false || resolvedUser.status === 'SUSPENDED' || resolvedUser.status === 'DEACTIVATED') {
+      res.status(403).json({ success: false, message: 'This management account has been deactivated. Please contact Olive Pizza Administration.' });
+      return;
+    }
+
+    const userRole = (resolvedUser.role || '').toLowerCase();
+    const isOwner = (isOwnerEmail || userRole === 'owner') && resolvedUser.is_active !== false;
+
+    // Parse PostgreSQL allowed_apps strictly
+    let allowedApps: string[] = [];
+    if (Array.isArray(resolvedUser.allowed_apps)) {
+      allowedApps = resolvedUser.allowed_apps.map((a: any) => String(a).toUpperCase());
+    } else if (typeof resolvedUser.allowed_apps === 'string') {
+      try {
+        const parsed = JSON.parse(resolvedUser.allowed_apps);
+        if (Array.isArray(parsed)) {
+          allowedApps = parsed.map((a: any) => String(a).toUpperCase());
+        } else {
+          allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
+        }
+      } catch {
+        allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
       }
     }
 
-    const userRole = (resolvedUser?.role || (isOwnerEmail ? 'owner' : 'manager')).toLowerCase();
-    const userName = resolvedUser?.name || cleanEmail.split('@')[0];
-    const branchId = resolvedUser?.branch_id || 'branch_rjn_main';
-    const franchiseId = resolvedUser?.franchise_id || 'fra_rajnandgaon';
+    // Verify app-specific eligibility: Owner receives OWNER access by default only. Other apps require explicit active grants.
+    const isAppAuthorized = appKey === 'OWNER' ? (isOwner || allowedApps.includes('OWNER')) : allowedApps.includes(appKey);
+    if (!isAppAuthorized) {
+      res.status(403).json({ success: false, message: `Access denied. Account is not authorized for ${appKey}. Explicit active grant in PostgreSQL allowed_apps is required.` });
+      return;
+    }
 
-    // 3. Resolve or create Firebase Auth user
-    let uid: string = resolvedUser?.firebase_uid || resolvedUser?.id;
+    const userName = resolvedUser.name || cleanEmail.split('@')[0];
+    const branchId = resolvedUser.branch_id || null;
+    const franchiseId = resolvedUser.franchise_id || null;
+
+    // 3. Resolve or verify Firebase Auth user (Identity verification only)
+    let uid: string = resolvedUser.firebase_uid || resolvedUser.id;
     if (!uid) {
       try {
         const userPromise = adminAuth.getUserByEmail(cleanEmail);
@@ -879,22 +872,26 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
               displayName: userName,
             });
             uid = newUser.uid;
-          } catch {
-            uid = `usr_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
+          } catch (createErr: any) {
+            console.error('[ManagementAuth] Firebase createUser failure:', createErr);
+            res.status(503).json({ success: false, message: 'Authentication service unavailable. Could not provision identity.' });
+            return;
           }
         } else {
-          uid = `usr_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
+          console.error('[ManagementAuth] Firebase getUserByEmail failure:', authErr);
+          res.status(503).json({ success: false, message: 'Authentication service unavailable. Could not verify identity.' });
+          return;
         }
       }
     }
 
-    // 4. Attach claims and generate custom token
+    // 4. Attach claims and generate custom token (No fabricated tokens permitted)
     const claims = {
       role: userRole,
       targetApp: appKey,
       branchId,
       franchiseId,
-      isOwnerMode: isOwnerEmail || userRole === 'owner'
+      isOwnerMode: isOwner
     };
     await adminAuth.setCustomUserClaims(uid, claims).catch(() => {});
 
@@ -902,11 +899,12 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
     try {
       customToken = await adminAuth.createCustomToken(uid, claims);
     } catch (tokenErr: any) {
-      console.warn('[ManagementAuth] createCustomToken notice:', tokenErr?.message);
-      customToken = `token_${uid}_${Date.now()}`;
+      console.error('[ManagementAuth] createCustomToken failure:', tokenErr?.message);
+      res.status(503).json({ success: false, message: 'Authentication service unavailable. Unable to create session token.' });
+      return;
     }
 
-    // 5. Update user record in Firestore
+    // 5. Update user projection in Firestore
     if (adminDb) {
       await adminDb.collection('users').doc(uid).set({
         email: cleanEmail,
@@ -916,7 +914,7 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
         franchiseId,
         lastLoginAt: new Date().toISOString(),
         emailVerified: true,
-        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+        allowedApps: isOwner && !allowedApps.includes('OWNER') ? [...allowedApps, 'OWNER'] : allowedApps
       }, { merge: true }).catch(() => {});
     }
 
@@ -929,10 +927,9 @@ router.post('/management/verify-code-signin', async (req: Request, res: Response
         name: userName,
         role: userRole,
         branchId,
-        branchName: 'Olive Pizza — Rajnandgaon HQ',
         franchiseId,
-        permissions: ['*'],
-        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+        permissions: isOwner ? ['*'] : [appKey.toLowerCase()],
+        allowedApps: isOwner && !allowedApps.includes('OWNER') ? [...allowedApps, 'OWNER'] : allowedApps
       }
     });
   } catch (err: any) {
@@ -994,7 +991,7 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
       return;
     }
 
-    // 2. Authoritative Database Search for Management Account
+    // 2. Authoritative Database Search for Management Account (PostgreSQL app_users canonical)
     const isOwnerEmail = email === 'webhub2811@gmail.com' || email === 'olivepizzarjn@gmail.com';
     let resolvedUser: any = null;
 
@@ -1011,53 +1008,21 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
         resolvedUser = pgRes.rows[0];
       }
     } catch (pgErr: any) {
-      console.warn('[ManagementGoogleAuth] PostgreSQL search warning:', pgErr?.message);
+      console.error('[ManagementGoogleAuth] PostgreSQL search failure:', pgErr?.message);
+      res.status(503).json({
+        success: false,
+        authorized: false,
+        message: 'Database service unavailable. Please try again later.'
+      });
+      return;
     }
 
-    // B. Query Firestore users fallback
-    if (!resolvedUser && adminDb) {
-      try {
-        const uSnap = await adminDb.collection('users').where('email', '==', email).limit(1).get();
-        if (!uSnap.empty) {
-          resolvedUser = { ...uSnap.docs[0].data(), id: uSnap.docs[0].id };
-        }
-      } catch (fsErr: any) {
-        console.warn('[ManagementGoogleAuth] Firestore users search warning:', fsErr?.message);
-      }
-    }
-
-    // C. Delivery partner check if target is DELIVERY
-    if (!resolvedUser && appKey === 'DELIVERY' && adminDb) {
-      try {
-        const dSnap = await adminDb.collection('delivery_partners').where('email', '==', email).limit(1).get();
-        if (!dSnap.empty) {
-          resolvedUser = { ...dSnap.docs[0].data(), id: dSnap.docs[0].id, role: 'delivery_partner' };
-        }
-      } catch (dErr: any) {
-        console.warn('[ManagementGoogleAuth] delivery_partners search warning:', dErr?.message);
-      }
-    }
-
-    // D. Super Admin / Owner account override if not present in DB
-    if (isOwnerEmail && !resolvedUser) {
-      resolvedUser = {
-        id: email === 'webhub2811@gmail.com' ? '6tLLR6q7aTYqzTG2blRx3TU5sA42' : 'usr_owner_olive',
-        email,
-        name: name || 'Olive Pizza Owner',
-        role: 'owner',
-        is_active: true,
-        franchise_id: 'fra_rajnandgaon',
-        branch_id: 'branch_rjn_main',
-        allowed_apps: ['RESTAURANT_MANAGER', 'POS', 'FRANCHISE_MANAGER', 'DELIVERY', 'OWNER']
-      };
-    }
-
-    // 3. Reject unregistered accounts (Fail Closed)
+    // 3. Reject unregistered accounts (Fail Closed - No Firestore fallback, no synthetic accounts)
     if (!resolvedUser) {
       res.status(403).json({
         success: false,
         authorized: false,
-        message: `Access denied. Google account (${email}) is not registered as an authorized staff or manager account. Please contact Olive Pizza administration.`
+        message: `Access denied. Google account (${email}) is not registered in PostgreSQL app_users. Please contact Olive Pizza administration.`
       });
       return;
     }
@@ -1074,33 +1039,27 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
 
     // 5. Authoritative App Role Verification
     const userRole = (resolvedUser.role || '').toLowerCase();
-    const isOwner = isOwnerEmail || userRole === 'owner' || userRole === 'admin' || userRole === 'developer';
-    const allowedApps = resolvedUser.allowed_apps || [];
+    const isOwner = (isOwnerEmail || userRole === 'owner') && resolvedUser.is_active !== false;
 
-    let isAppAuthorized = false;
-    if (isOwner) {
-      isAppAuthorized = true; // Global Owner accounts have universal access across all 5 management apps
-    } else {
-      switch (appKey) {
-        case 'RESTAURANT_MANAGER':
-          isAppAuthorized = ['restaurant_manager', 'manager', 'kitchen', 'owner', 'admin'].includes(userRole) || allowedApps.includes('RESTAURANT_MANAGER');
-          break;
-        case 'FRANCHISE_MANAGER':
-          isAppAuthorized = ['franchise_manager', 'franchise', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('FRANCHISE_MANAGER');
-          break;
-        case 'POS':
-          isAppAuthorized = ['cashier', 'pos', 'manager', 'owner', 'admin'].includes(userRole) || allowedApps.includes('POS');
-          break;
-        case 'DELIVERY':
-          isAppAuthorized = ['delivery_partner', 'rider', 'owner', 'admin'].includes(userRole) || allowedApps.includes('DELIVERY');
-          break;
-        case 'OWNER':
-          isAppAuthorized = isOwner;
-          break;
-        default:
-          isAppAuthorized = false;
+    // Parse PostgreSQL allowed_apps strictly
+    let allowedApps: string[] = [];
+    if (Array.isArray(resolvedUser.allowed_apps)) {
+      allowedApps = resolvedUser.allowed_apps.map((a: any) => String(a).toUpperCase());
+    } else if (typeof resolvedUser.allowed_apps === 'string') {
+      try {
+        const parsed = JSON.parse(resolvedUser.allowed_apps);
+        if (Array.isArray(parsed)) {
+          allowedApps = parsed.map((a: any) => String(a).toUpperCase());
+        } else {
+          allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
+        }
+      } catch {
+        allowedApps = [resolvedUser.allowed_apps.toUpperCase()];
       }
     }
+
+    // Owner receives OWNER access by default only. Other apps require explicit active grants in allowed_apps.
+    const isAppAuthorized = appKey === 'OWNER' ? (isOwner || allowedApps.includes('OWNER')) : allowedApps.includes(appKey);
 
     if (!isAppAuthorized) {
       const appNames: Record<string, string> = {
@@ -1113,7 +1072,7 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
       res.status(403).json({
         success: false,
         authorized: false,
-        message: `Account (${email}) is verified, but not authorized for ${appNames[appKey] || appKey}. Please contact Olive Pizza Administration.`
+        message: `Account (${email}) is verified, but not authorized for ${appNames[appKey] || appKey}. Explicit active grant in PostgreSQL allowed_apps is required.`
       });
       return;
     }
@@ -1134,8 +1093,8 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
     }
 
     // 7. Update custom user claims
-    const branchId = resolvedUser.branch_id || 'branch_rjn_main';
-    const franchiseId = resolvedUser.franchise_id || 'fra_rajnandgaon';
+    const branchId = resolvedUser.branch_id || null;
+    const franchiseId = resolvedUser.franchise_id || null;
     const claims = {
       role: userRole,
       targetApp: appKey,
@@ -1145,13 +1104,14 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
     };
     await adminAuth.setCustomUserClaims(firebaseUid, claims).catch(() => {});
 
-    // 8. Generate custom token for Firebase client session
+    // 8. Generate custom token for Firebase client session (No fabricated tokens)
     let customToken: string;
     try {
       customToken = await adminAuth.createCustomToken(firebaseUid, claims);
     } catch (ctErr: any) {
-      console.warn('[ManagementGoogleAuth] createCustomToken notice:', ctErr?.message);
-      customToken = `token_${firebaseUid}_${Date.now()}`;
+      console.error('[ManagementGoogleAuth] createCustomToken failure:', ctErr?.message);
+      res.status(503).json({ success: false, authorized: false, message: 'Authentication service unavailable. Unable to create session token.' });
+      return;
     }
 
     // 9. Sync profile to Firestore
@@ -1165,7 +1125,7 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
         lastLoginAt: new Date().toISOString(),
         emailVerified: true,
         authProvider: 'google.com',
-        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+        allowedApps: isOwner && !allowedApps.includes('OWNER') ? [...allowedApps, 'OWNER'] : allowedApps
       }, { merge: true }).catch(() => {});
     }
 
@@ -1181,10 +1141,9 @@ router.post('/management/google-signin', async (req: Request, res: Response): Pr
         name: resolvedUser.name || name,
         role: userRole,
         branchId,
-        branchName: 'Olive Pizza — Rajnandgaon HQ',
         franchiseId,
-        permissions: ['*'],
-        allowedApps: [appKey, 'RESTAURANT_MANAGER', 'FRANCHISE_MANAGER', 'POS', 'DELIVERY', 'OWNER']
+        permissions: isOwner ? ['*'] : [appKey.toLowerCase()],
+        allowedApps: isOwner && !allowedApps.includes('OWNER') ? [...allowedApps, 'OWNER'] : allowedApps
       }
     });
   } catch (err: any) {

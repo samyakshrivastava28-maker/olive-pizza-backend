@@ -399,6 +399,7 @@ app.use('/api/coupons', couponRoutes);
 
 app.use('/tracking', trackingRoutes);
 app.use('/api/tracking', trackingRoutes);
+app.use('/api/v1/tracking', trackingRoutes);
 
 app.use('/email', emailRoutes);
 app.use('/api/email', emailRoutes);
