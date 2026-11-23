@@ -62,7 +62,7 @@ test('Layerbase PostgreSQL & Redis Live Integration Suite', async (t) => {
     assert.ok(versionRes.rows.length > 0, 'Must query Layerbase successfully');
     const versionStr = versionRes.rows[0].version;
     assert.match(versionStr, /PostgreSQL (16|17|18)/i, 'PostgreSQL version must be 16+');
-    assert.ok(['testsql', 'olive_pizza_test'].includes(versionRes.rows[0].current_database), 'Target database is testsql or olive_pizza_test');
+    assert.ok(['testsql', 'olive_pizza_test', 'olivepizza', 'olive_pizza'].includes(versionRes.rows[0].current_database), 'Target database is testsql, olive_pizza_test, or olivepizza');
 
     // Run migration verification
     const migrationResult = await runMigrations();

@@ -1,3 +1,9 @@
+/**
+ * DEPRECATION NOTICE (Milestone 2):
+ * PostgreSQL catalog tables (menu_products, menu_categories, menu_combos, menu_coupons)
+ * are DEPRECATED. Firestore is the sole permanent source of truth for the Olive Pizza
+ * Menu Catalog. This script is retained for historical / archival reference only.
+ */
 import { query, pgPool } from '../config/postgres.js';
 import { redisService } from '../services/redis/RedisService.js';
 

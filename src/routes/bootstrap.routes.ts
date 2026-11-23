@@ -148,24 +148,6 @@ router.get(['/home/bootstrap', '/v1/home/bootstrap'], optionalAuth, async (req: 
           } catch (fsErr: any) {
             console.warn('[Bootstrap] Home products Firestore notice:', fsErr.message);
           }
-          if (items.length === 0) {
-            const pgProds = await query('SELECT * FROM menu_products WHERE is_active = true ORDER BY is_featured DESC, rating DESC LIMIT 16').catch(() => ({ rows: [] }));
-            if (pgProds.rows.length > 0) {
-              items = pgProds.rows.map((r: any) => ({
-                id: r.id,
-                name: r.name,
-                description: r.description || '',
-                category: r.category_name || 'Pizzas',
-                basePrice: Number(r.base_price || 299),
-                price: Number(r.base_price || 299),
-                imageUrl: r.image_url || 'https://images.unsplash.com/photo-1513104890138-7c749659a591?w=500',
-                isVegetarian: r.is_vegetarian ?? true,
-                isFeatured: r.is_featured ?? true,
-                variants: r.variants || ['Regular (7")', 'Medium (10")', 'Large (12")'],
-                rating: Number(r.rating || 4.8)
-              }));
-            }
-          }
 
           // Apply PostgreSQL authoritative franchise prices first
           try {
@@ -236,30 +218,7 @@ router.get(['/home/bootstrap', '/v1/home/bootstrap'], optionalAuth, async (req: 
               };
             });
           }
-          const pgCats = await query('SELECT * FROM menu_categories WHERE is_active = true ORDER BY display_order ASC').catch(() => ({ rows: [] }));
-          if (pgCats.rows.length > 0) {
-            return pgCats.rows.map((r: any) => ({
-              id: r.id,
-              name: r.name,
-              description: r.description || '',
-              emoji: r.emoji || '🍕',
-              imageUrl: r.image_url || '',
-              subcategories: r.subcategories || []
-            }));
-          }
           return DEFAULT_CATEGORIES;
-
-          return snap.docs.map(doc => {
-            const data = doc.data();
-            return {
-              id: doc.id,
-              name: data.name || 'Category',
-              description: data.description || '',
-              emoji: data.emoji || '🍕',
-              imageUrl: data.imageUrl || data.image || '',
-              subcategories: data.subcategories || data.subCategories || []
-            };
-          });
         } catch {
           return DEFAULT_CATEGORIES;
         }
@@ -516,17 +475,6 @@ router.get(['/menu/bootstrap', '/v1/menu/bootstrap'], async (req: AuthRequest, r
               };
             });
           }
-          const pgCats = await query('SELECT * FROM menu_categories WHERE is_active = true ORDER BY display_order ASC').catch(() => ({ rows: [] }));
-          if (pgCats.rows.length > 0) {
-            return pgCats.rows.map((r: any) => ({
-              id: r.id,
-              name: r.name,
-              description: r.description || '',
-              emoji: r.emoji || '🍕',
-              imageUrl: r.image_url || '',
-              subcategories: r.subcategories || []
-            }));
-          }
           return DEFAULT_CATEGORIES;
         } catch {
           return DEFAULT_CATEGORIES;
@@ -565,31 +513,6 @@ router.get(['/menu/bootstrap', '/v1/menu/bootstrap'], async (req: AuthRequest, r
             }
           } catch (fsErr: any) {
             console.warn('[Bootstrap] Menu products Firestore notice:', fsErr.message);
-          }
-
-          if (items.length === 0) {
-            const pgProds = await query('SELECT * FROM menu_products WHERE is_active = true ORDER BY is_featured DESC, rating DESC').catch(() => ({ rows: [] }));
-            if (pgProds.rows.length > 0) {
-              items = pgProds.rows.map((r: any) => ({
-                id: r.id,
-                name: r.name,
-                description: r.description || '',
-                category: r.category_name || 'Pizzas',
-                basePrice: Number(r.base_price || 299),
-                price: Number(r.base_price || 299),
-                imageUrl: r.image_url || 'https://images.unsplash.com/photo-1513104890138-7c749659a591?w=500',
-                isVegetarian: r.is_vegetarian ?? true,
-                isActive: r.is_active ?? true,
-                variants: r.variants || ['Regular (7")', 'Medium (10")', 'Large (12")'],
-                crusts: r.crusts || ['Classic Hand Tossed', 'Thin Crust', 'Cheese Burst'],
-                addons: r.addons || [
-                  { id: 'add_extra_cheese', name: 'Extra Cheese', price: 60 },
-                  { id: 'add_jalapeno', name: 'Pickled Jalapenos', price: 40 },
-                  { id: 'add_olives', name: 'Black Olives', price: 45 }
-                ],
-                channelAvailability: r.channel_availability || { online: true, dineIn: true, takeaway: true, posDelivery: true }
-              }));
-            }
           }
 
           if (items.length === 0) {
@@ -661,20 +584,6 @@ router.get(['/menu/bootstrap', '/v1/menu/bootstrap'], async (req: AuthRequest, r
             console.warn('[Bootstrap] Menu coupons Firestore notice:', fsErr.message);
           }
 
-          if (coupons.length === 0) {
-            const pgCoups = await query('SELECT * FROM menu_coupons WHERE is_active = true ORDER BY discount_value DESC LIMIT 10').catch(() => ({ rows: [] }));
-            if (pgCoups.rows.length > 0) {
-              coupons = pgCoups.rows.map((r: any) => ({
-                id: r.id,
-                code: r.code,
-                type: r.discount_type || 'percentage',
-                discountValue: Number(r.discount_value || 0),
-                minOrderValue: Number(r.min_order_amount || 0),
-                maxDiscount: Number(r.max_discount_amount || 0),
-                description: r.description || `Get ${r.discount_value}% off`
-              }));
-            }
-          }
           return coupons;
         } catch {
           return [];

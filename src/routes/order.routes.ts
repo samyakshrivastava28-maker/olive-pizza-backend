@@ -116,6 +116,9 @@ router.get('/', verifyToken, async (req: AuthRequest, res: Response): Promise<vo
                    'quantity', i.quantity,
                    'unitPrice', i.unit_price,
                    'price', i.unit_price,
+                   'tax', i.tax_amount,
+                   'taxAmount', i.tax_amount,
+                   'discount', i.discount_amount,
                    'lineTotal', i.line_total,
                    'addons', i.addons_json
                  )
@@ -322,6 +325,9 @@ router.get('/live', verifyToken, requireRole(['restaurant_manager', 'owner', 'ki
                  'quantity', i.quantity,
                  'unitPrice', i.unit_price,
                  'price', i.unit_price,
+                 'tax', i.tax_amount,
+                 'taxAmount', i.tax_amount,
+                 'discount', i.discount_amount,
                  'lineTotal', i.line_total,
                  'addons', i.addons_json
                )
@@ -473,10 +479,10 @@ router.get('/bill/:billReference', verifyToken, async (req: AuthRequest, res: Re
     // Fallback 2: Check PostgreSQL canonical tables if not found in Firestore
     if (!orderDoc) {
       const pgRes = await query(
-        `SELECT co.*, cb.permanent_bill_no, cb.bill_number, cb.daily_order_no
+        `SELECT co.*, cb.id AS canonical_bill_id, cb.net_amount, cb.is_cancelled AS bill_cancelled
          FROM canonical_orders co
          LEFT JOIN canonical_bills cb ON cb.order_id = co.id
-         WHERE co.id = $1 OR co.bill_reference = $1 OR cb.bill_reference = $1 OR cb.permanent_bill_no::text = $1
+         WHERE co.id = $1 OR co.permanent_bill_no::text = $1
          LIMIT 1`,
         [billReference]
       ).catch(() => ({ rows: [] }));
@@ -1337,40 +1343,18 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
 
       let menuData: any = null;
       try {
-        const { query } = await import('../lib/db.js');
-        const pRes = await query(
-          `SELECT id, name, category_id, image_url, is_active FROM menu_products WHERE id = $1 LIMIT 1`,
-          [itemId]
-        );
-        if (pRes.rows.length > 0) {
-          const p = pRes.rows[0];
-          menuData = {
-            name: p.name,
-            productName: p.name,
-            imageUrl: p.image_url,
-            isAvailable: p.is_active,
-            isActive: p.is_active,
-            price: authoritativePrice.unitPrice,
-            basePrice: authoritativePrice.basePrice
-          };
-        }
-      } catch (pgPErr: any) {}
-
-      if (!menuData) {
-        try {
-          // Fetch product/combo metadata for image & category
-          let docSnap = await adminDb.collection('products').doc(itemId).get();
+        // Fetch product/combo metadata directly from authoritative Firestore catalog
+        let docSnap = await adminDb.collection('products').doc(itemId).get();
+        if (docSnap.exists) {
+          menuData = docSnap.data();
+        } else {
+          docSnap = await adminDb.collection('combos').doc(itemId).get();
           if (docSnap.exists) {
             menuData = docSnap.data();
-          } else {
-            docSnap = await adminDb.collection('combos').doc(itemId).get();
-            if (docSnap.exists) {
-              menuData = docSnap.data();
-            }
           }
-        } catch (dbReadErr) {
-          console.warn('[Orders] DB lookup fallback:', dbReadErr);
         }
+      } catch (dbReadErr) {
+        console.warn('[Orders] Firestore catalog lookup fallback:', dbReadErr);
       }
 
       if (!menuData) {

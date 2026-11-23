@@ -107,6 +107,9 @@ router.get('/summary', async (req: AuthRequest, res: Response) => {
             'name', oi.item_name,
             'quantity', oi.quantity,
             'price', oi.unit_price,
+            'tax', oi.tax_amount,
+            'taxAmount', oi.tax_amount,
+            'discount', oi.discount_amount,
             'total', oi.line_total
           )) FROM canonical_order_items oi WHERE oi.order_id = o.id),
           '[]'::json

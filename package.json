@@ -7,7 +7,8 @@
     "dev": "tsx watch server.ts",
     "build": "tsc",
     "start": "npx tsx server.ts",
-    "test": "node --import tsx --test --test-force-exit src/tests/*.test.ts src/tests/**/*.test.ts"
+    "test": "node --import tsx --test --test-force-exit src/tests/*.test.ts src/tests/**/*.test.ts",
+    "test:e2e:api": "node --import tsx --test --test-force-exit src/tests/e2e/*.e2e.test.ts"
   },
   "engines": {
     "node": ">=20 <=25"

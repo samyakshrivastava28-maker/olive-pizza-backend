@@ -81,7 +81,7 @@ export class DailySheetsSyncJob {
       let orders: any[] = [];
       try {
         const pgRes = await query(
-          `SELECT co.*, cb.permanent_bill_no, cb.bill_number, cb.daily_order_no
+          `SELECT co.*, cb.id AS canonical_bill_id, cb.net_amount
            FROM canonical_orders co
            LEFT JOIN canonical_bills cb ON cb.order_id = co.id
            WHERE co.order_date = $1::date

@@ -111,67 +111,49 @@ export class POSService {
     }
 
     try {
-      // 0. Primary: PostgreSQL menu_products & menu_combos by ID
-      try {
-        let pgProd = await query('SELECT * FROM menu_products WHERE id = $1 LIMIT 1', [itemId]);
-        if (pgProd.rows.length === 0 && itemName) {
-          // Fallback: match by product name keyword in PostgreSQL
-          const cleanName = itemName.replace(/[^a-zA-Z0-9\s]/g, '').trim();
-          const firstWord = cleanName.split(/\s+/)[0] || cleanName;
-          pgProd = await query(
-            'SELECT * FROM menu_products WHERE name ILIKE $1 OR name ILIKE $2 LIMIT 1',
-            [`%${cleanName}%`, `%${firstWord}%`]
-          );
-        }
+      // 1. Check products collection
+      let docSnap = await adminDb.collection('products').doc(itemId).get();
+      if (docSnap.exists) {
+        const data = docSnap.data();
+        const item = { id: docSnap.id, ...data };
+        this.catalogCache.set(cacheKey, { item, timestamp: now });
+        this.catalogCache.set(itemId, { item, timestamp: now });
+        return item;
+      }
 
-        if (pgProd.rows.length > 0) {
-          const r = pgProd.rows[0];
-          const item = {
-            id: r.id,
-            productName: r.name,
-            name: r.name,
-            description: r.description,
-            basePrice: Number(r.base_price),
-            price: Number(r.base_price),
-            imageUrl: r.image_url,
-            isVegetarian: r.is_vegetarian,
-            isActive: r.is_active,
-            variants: r.variants,
-            crusts: r.crusts,
-            addons: r.addons,
-            channelAvailability: r.channel_availability,
-            rating: Number(r.rating)
-          };
+      // 2. Check combos collection
+      docSnap = await adminDb.collection('combos').doc(itemId).get();
+      if (docSnap.exists) {
+        const data = docSnap.data();
+        const item = { id: docSnap.id, ...data };
+        this.catalogCache.set(cacheKey, { item, timestamp: now });
+        this.catalogCache.set(itemId, { item, timestamp: now });
+        return item;
+      }
+
+      // 3. Check menu_items collection
+      docSnap = await adminDb.collection('menu_items').doc(itemId).get();
+      if (docSnap.exists) {
+        const data = docSnap.data();
+        const item = { id: docSnap.id, ...data };
+        this.catalogCache.set(cacheKey, { item, timestamp: now });
+        this.catalogCache.set(itemId, { item, timestamp: now });
+        return item;
+      }
+
+      // 4. Fallback: query Firestore products by productName or name if itemName provided
+      if (itemName) {
+        let nameQuery = await adminDb.collection('products').where('productName', '==', itemName).limit(1).get();
+        if (nameQuery.empty) {
+          nameQuery = await adminDb.collection('products').where('name', '==', itemName).limit(1).get();
+        }
+        if (!nameQuery.empty) {
+          const doc = nameQuery.docs[0];
+          const item = { id: doc.id, ...doc.data() };
           this.catalogCache.set(cacheKey, { item, timestamp: now });
           this.catalogCache.set(itemId, { item, timestamp: now });
           return item;
         }
-      } catch (pgErr: any) {
-        console.warn('[POSService] PostgreSQL catalog query notice for ' + itemId + ':', pgErr.message);
-      }
-
-      // 1. Check products collection
-      let docSnap = await adminDb.collection('products').doc(itemId).get();
-      if (docSnap.exists) {
-        const item = docSnap.data();
-        this.catalogCache.set(itemId, { item, timestamp: now });
-        return item;
-      }
-
-      // 2. Check menu_items collection
-      docSnap = await adminDb.collection('menu_items').doc(itemId).get();
-      if (docSnap.exists) {
-        const item = docSnap.data();
-        this.catalogCache.set(itemId, { item, timestamp: now });
-        return item;
-      }
-
-      // 3. Check combos collection
-      docSnap = await adminDb.collection('combos').doc(itemId).get();
-      if (docSnap.exists) {
-        const item = docSnap.data();
-        this.catalogCache.set(itemId, { item, timestamp: now });
-        return item;
       }
     } catch (e: any) {
       console.warn('[POSService] Catalog lookup error:', e?.message);

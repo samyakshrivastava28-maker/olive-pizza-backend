@@ -443,19 +443,22 @@ export class CanonicalOrderService {
 
         // 2.2 Insert immutable line items with deterministic line item IDs
         for (let idx = 0; idx < processedItems.length; idx++) {
-          const item = processedItems[idx];
+          const item: any = processedItems[idx];
           const lineItemId = `${orderId}_item_${idx + 1}`;
+          const itemTax = item.taxAmount || Math.round(item.lineTotal * 0.05 * 100) / 100;
+          const itemDiscount = item.discountAmount || 0;
           await client.query(`
             INSERT INTO canonical_order_items (
               id, order_id, menu_item_id, item_name, size_variant,
-              crust, quantity, unit_price, addons_json, line_total
+              crust, quantity, unit_price, addons_json, tax_amount, discount_amount, line_total
             ) VALUES (
               $1, $2, $3, $4, $5,
-              $6, $7, $8, $9::jsonb, $10
+              $6, $7, $8, $9::jsonb, $10, $11, $12
             ) ON CONFLICT (id) DO NOTHING;
           `, [
             lineItemId, orderId, item.menuItemId || null, item.name, item.size || 'Regular',
-            item.crust || 'Normal', item.quantity, item.unitPrice, JSON.stringify(item.addons || []), item.lineTotal
+            item.crust || 'Normal', item.quantity, item.unitPrice, JSON.stringify(item.addons || []),
+            itemTax, itemDiscount, item.lineTotal
           ]);
         }
 

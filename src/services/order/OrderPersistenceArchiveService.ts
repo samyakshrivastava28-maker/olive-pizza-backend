@@ -244,35 +244,22 @@ export class OrderPersistenceArchiveService {
           const itQty = Math.max(1, Number(it.quantity) || 1);
           const itPrice = Number(it.price || it.unitPrice || 0);
           const lineTotal = Number(it.lineTotal || (itQty * itPrice));
+          const itTax = Number(it.tax || it.taxAmount || Math.round(lineTotal * 0.05 * 100) / 100);
+          const itDiscount = Number(it.discount || it.discountAmount || 0);
 
           await client.query(`
             INSERT INTO canonical_order_items (
               id, order_id, menu_item_id, item_name, size_variant,
-              crust, quantity, unit_price, addons_json, line_total
+              crust, quantity, unit_price, addons_json, tax_amount, discount_amount, line_total
             ) VALUES (
               $1, $2, $3, $4, $5,
-              $6, $7, $8, $9::jsonb, $10
-            ) ON CONFLICT (id) DO UPDATE SET
-              item_name = EXCLUDED.item_name,
-              size_variant = EXCLUDED.size_variant,
-              crust = EXCLUDED.crust,
-              quantity = EXCLUDED.quantity,
-              unit_price = EXCLUDED.unit_price,
-              addons_json = EXCLUDED.addons_json,
-              line_total = EXCLUDED.line_total;
+              $6, $7, $8, $9::jsonb, $10, $11, $12
+            ) ON CONFLICT (id) DO NOTHING;
           `, [
             itemId, orderId, it.menuItemId || it.id || null, itName,
             it.size || 'Regular', it.crust || 'Normal', itQty, itPrice,
-            JSON.stringify(it.addons || []), lineTotal
+            JSON.stringify(it.addons || []), itTax, itDiscount, lineTotal
           ]);
-        }
-
-        // Clean up any stale items for this order not in current payload
-        if (currentItemIds.length > 0) {
-          await client.query(`
-            DELETE FROM canonical_order_items 
-            WHERE order_id = $1 AND id != ALL($2::text[])
-          `, [orderId, currentItemIds]);
         }
 
         // 3. Upsert canonical financial bill
@@ -666,6 +653,9 @@ export class OrderPersistenceArchiveService {
                 'quantity', i.quantity,
                 'unitPrice', i.unit_price,
                 'price', i.unit_price,
+                'tax', i.tax_amount,
+                'taxAmount', i.tax_amount,
+                'discount', i.discount_amount,
                 'lineTotal', i.line_total,
                 'addons', i.addons_json
               )
@@ -794,6 +784,9 @@ export class OrderPersistenceArchiveService {
                 'quantity', i.quantity,
                 'unitPrice', i.unit_price,
                 'price', i.unit_price,
+                'tax', i.tax_amount,
+                'taxAmount', i.tax_amount,
+                'discount', i.discount_amount,
                 'lineTotal', i.line_total
               )
             ) FILTER (WHERE i.id IS NOT NULL),
