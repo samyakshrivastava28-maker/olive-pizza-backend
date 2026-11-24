@@ -248,7 +248,9 @@ router.post('/verify', verifyToken, async (req: AuthRequest, res: Response) => {
 
       await client.query(
         `UPDATE payments 
-         SET status = 'PAYMENT_CAPTURED', provider_transaction_id = $2, verified_at = NOW(), updated_at = NOW() 
+         SET status = 'PAYMENT_CAPTURED', 
+             metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('provider_transaction_id', $2::text, 'verified_at', NOW()::text),
+             updated_at = NOW() 
          WHERE id = $1`,
         [paymentId, finalTxId]
       );
@@ -473,6 +475,58 @@ router.get('/cod/status/:orderId', verifyToken, async (req: AuthRequest, res: Re
   } catch (error: any) {
     console.error('[PaymentRoute] Error in /cod/status:', error.message);
     res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+// ─── 4C-2. Authoritative Online Payment Status (Polling / Recovery) ──────────
+router.get('/status/:orderId', optionalAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const orderId = req.params.orderId;
+    if (!orderId) {
+      return res.status(400).json({ success: false, error: 'Order ID is required' });
+    }
+
+    // Check canonical_orders in PostgreSQL
+    const orderRes = await query(
+      `SELECT id, payment_status, is_paid, status, total_amount, payment_id FROM canonical_orders WHERE id = $1 LIMIT 1`,
+      [orderId]
+    );
+
+    if (orderRes.rows.length > 0) {
+      const order = orderRes.rows[0];
+      const isPaid = order.is_paid || order.payment_status === 'PAID';
+      return res.json({
+        success: true,
+        orderId: order.id,
+        status: isPaid ? 'paid' : (order.status || 'pending'),
+        verified: isPaid,
+        paymentStatus: order.payment_status,
+        amount: order.total_amount
+      });
+    }
+
+    // Check payments table in PostgreSQL
+    const payRes = await query(
+      `SELECT id, status, amount, metadata FROM payments WHERE id = $1 OR metadata->>'orderId' = $1 LIMIT 1`,
+      [orderId]
+    );
+
+    if (payRes.rows.length > 0) {
+      const pay = payRes.rows[0];
+      const isCaptured = pay.status === 'PAYMENT_CAPTURED' || pay.status === 'paid';
+      return res.json({
+        success: true,
+        paymentId: pay.id,
+        status: isCaptured ? 'paid' : (pay.status || 'pending'),
+        verified: isCaptured,
+        amount: pay.amount
+      });
+    }
+
+    return res.status(404).json({ success: false, error: 'Payment or order not found' });
+  } catch (error: any) {
+    console.error('[PaymentRoute] Error in /status/:orderId:', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

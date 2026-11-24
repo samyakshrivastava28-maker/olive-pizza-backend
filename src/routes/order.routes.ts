@@ -43,17 +43,37 @@ const withFirestoreTimeout = withTimeout;
  */
 async function getNextDailyOrderNumber(): Promise<{ dailyOrderNumber: number; orderDateLocal: string }> {
   const today = getLocalDateString();
-  const counterRef = adminDb.collection('counters').doc('dailyOrders');
+  try {
+    const counterRef = adminDb.collection('counters').doc('dailyOrders');
+    const transactionPromise = adminDb.runTransaction(async (t) => {
+      const snap = await t.get(counterRef);
+      const data = snap.exists ? snap.data()! : { date: today, count: 0 };
+      const newCount = data.date === today ? (data.count as number) + 1 : 1;
+      t.set(counterRef, { date: today, count: newCount });
+      return newCount;
+    });
 
-  const dailyOrderNumber = await adminDb.runTransaction(async (t) => {
-    const snap = await t.get(counterRef);
-    const data = snap.exists ? snap.data()! : { date: today, count: 0 };
-    const newCount = data.date === today ? (data.count as number) + 1 : 1;
-    t.set(counterRef, { date: today, count: newCount });
-    return newCount;
-  });
+    const timeoutPromise = new Promise<number>((_, reject) =>
+      setTimeout(() => reject(new Error('Firestore transaction timeout')), 3000)
+    );
 
-  return { dailyOrderNumber, orderDateLocal: today };
+    const dailyOrderNumber = await Promise.race([transactionPromise, timeoutPromise]);
+    return { dailyOrderNumber, orderDateLocal: today };
+  } catch (err: any) {
+    console.warn('[OrderRoutes] Firestore dailyOrders counter fallback to PostgreSQL:', err?.message || err);
+    try {
+      const pgRes = await query(
+        `SELECT COALESCE(MAX(daily_order_number), 0) + 1 AS next_no 
+         FROM canonical_orders 
+         WHERE order_date_local = $1`,
+        [today]
+      );
+      const nextNo = Number(pgRes.rows[0]?.next_no) || Math.floor((Date.now() % 86400000) / 1000);
+      return { dailyOrderNumber: nextNo, orderDateLocal: today };
+    } catch {
+      return { dailyOrderNumber: Math.floor((Date.now() % 86400000) / 1000), orderDateLocal: today };
+    }
+  }
 }
 
 const router = Router();
@@ -1619,7 +1639,7 @@ router.post('/', verifyToken, idempotency(), async (req: AuthRequest, res: Respo
         'VALUES ($1, $2, NOW() + INTERVAL \'10 seconds\') ' +
         'ON CONFLICT (user_id) DO UPDATE ' +
         'SET device_id = EXCLUDED.device_id, locked_at = NOW(), expires_at = NOW() + INTERVAL \'10 seconds\' ' +
-        'WHERE checkout_locks.expires_at < NOW() OR checkout_locks.device_id = EXCLUDED.device_id ' +
+        'WHERE checkout_locks.expires_at < NOW() ' +
         'RETURNING user_id;',
         [userId, deviceId]
       );
