@@ -27,6 +27,7 @@ export interface CreatePaymentSessionParams {
   customerName?: string;
   customerPhone?: string;
   customerEmail?: string;
+  orderId?: string;
 }
 
 export class PaymentService {
@@ -93,20 +94,29 @@ export class PaymentService {
       if (!isAuthoritativelyResolved) {
         let menuData: any = null;
         if (!itemId.startsWith('item-')) {
-          let snap = await adminDb.collection('products').doc(itemId).get();
-          if (snap.exists) {
-            menuData = snap.data();
-          } else {
-            snap = await adminDb.collection('menu_items').doc(itemId).get();
+          try {
+            let snap = await adminDb.collection('products').doc(itemId).get();
             if (snap.exists) {
               menuData = snap.data();
             } else {
-              snap = await adminDb.collection('combos').doc(itemId).get();
+              snap = await adminDb.collection('menu_items').doc(itemId).get();
               if (snap.exists) {
                 menuData = snap.data();
+              } else {
+                snap = await adminDb.collection('combos').doc(itemId).get();
+                if (snap.exists) {
+                  menuData = snap.data();
+                }
               }
             }
+          } catch (err: any) {
+            console.warn('[PaymentService] Firestore catalog fetch notice:', err?.message);
           }
+        }
+
+        if (!menuData) {
+          const { POSService } = await import('../pos/POSService.js');
+          menuData = await POSService.getCatalogItem(itemId, item.name);
         }
 
         if (!menuData) {
@@ -336,7 +346,7 @@ export class PaymentService {
         config.currency,
         state,
         params.paymentMethod,
-        JSON.stringify({ items: validatedItems, deliveryAddress: params.deliveryAddress }),
+        JSON.stringify({ items: validatedItems, deliveryAddress: params.deliveryAddress, orderId: params.orderId }),
       ]);
     } catch (err: any) {
       console.error('[PaymentService] CRITICAL: Canonical payment persistence failed in PostgreSQL:', err.message);
